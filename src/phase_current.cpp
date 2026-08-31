@@ -1352,6 +1352,8 @@ static void noiseReport(const char *title) {
   }
 }
 
+uint32_t phaseCurrentRejects() { return s_rejCur; }
+
 void phaseCurrentDiag(uint32_t ms) {
   if (!s_ready) { Serial.println("[idiag] sensor nao inicializado"); return; }
   Serial.printf("[idiag] === diagnostico (%lu ms) ===\n", (unsigned long)ms);

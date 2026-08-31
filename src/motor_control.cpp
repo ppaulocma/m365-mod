@@ -1455,8 +1455,17 @@ static void controlSlice(float dt) {
     } else {
       fwIdA = fmaxf(0.0f, fwIdA - 20.0f * dt);    // colapso rápido
     }
-    s_fwIdTarget = -fwIdA;                         // alvo da malha de d
-    motor.zero_electric_angle = prm(P_ZEA) - mtpaTrim - mtpaExplore;
+    // s_fwIdTarget NÃO sai daqui: ele é fechado junto com o teto de corrente,
+    // mais abaixo, porque o id do FW e o iq dividem o MESMO orçamento de
+    // corrente de fase e sofrem os MESMOS derates.
+
+    // O trim do MTPA só entra se o MTPA estiver LIGADO. Ele é aprendido e
+    // gravado em NVS ("mtpa"), e era aplicado sempre — inclusive com a feature
+    // desligada. Um trim aprendido meses atrás ficava deslocando a comutação
+    // em silêncio, sem aparecer no 'params' (é chave própria, não é
+    // parâmetro). Mesmo tipo de armadilha que o P_COMM_LEAD persistido.
+    const float trim = (prm(P_MTPA) >= 0.5f) ? (mtpaTrim + mtpaExplore) : 0.0f;
+    motor.zero_electric_angle = prm(P_ZEA) - trim;
   }
 
   // Ganhos do PID de velocidade ao vivo (parâmetros do app)
@@ -1688,6 +1697,22 @@ static void controlSlice(float dt) {
   //     tensão. Reduzir CORRENTE é o certo: reduzir tensão como antes mexia
   //     no torque por um caminho indireto e dependente da velocidade.
   float iqMax = fminf(prm(P_IQ_MAX), (float)IQ_MAX_ABS_A) * scale;
+
+  // ---- ORÇAMENTO DE CORRENTE COMPARTILHADO COM O FIELD WEAKENING ---------
+  // O id do FW é corrente REAL: entra em |I|, no trip de fase e no calor
+  // exatamente como o iq. Sem dividir o orçamento, o app deixa configurar
+  // P_IQ_MAX + P_FW_MAX_A cuja soma VETORIAL passa do trip — p.ex. 30 A de iq
+  // com 15 A de id dão |I| = 33,5 A contra um trip de 30 A, ou seja, ligar o
+  // FW garantia trip no topo. É a mesma lógica do orçamento de TENSÃO entre
+  // Ud e Uq que já existe: o que o d toma, o q não tem.
+  //
+  // E o FW sofre os MESMOS derates do torque (scale = foldback de bateria x
+  // térmico x tensão). Antes ele ficava injetando id em cima de um motor já
+  // em derate térmico — despejando calor exatamente onde se pedia menos.
+  const float fwId = fwIdA * scale;
+  s_fwIdTarget = -fwId;                       // alvo entregue à malha de d
+  if (fwId > 0.05f)
+    iqMax = sqrtf(fmaxf(iqMax * iqMax - fwId * fwId, 0.0f));
   // Walk e trava eletrônica são limites de FASE por natureza: acontecem a ~0
   // km/h, onde a corrente de bateria é quase nula e só a de fase existe.
   // Aplicá-los aqui é mais correto do que no foldback de bateria (onde
@@ -3528,6 +3553,13 @@ void motorEnergyInit() {
   pr.end();
   Serial.printf("[energy] odometro %.1f km | capacidade %.0f Wh\n",
                 odoM / 1000.0f, capLearned);
+  // O trim do MTPA vive em chave PRÓPRIA de NVS, então não aparece no
+  // 'params'. Já foi um deslocamento invisível de até 5,7 graus na comutação;
+  // agora ele só age com o MTPA ligado E aparece no boot.
+  if (fabsf(mtpaTrim) > 0.001f)
+    Serial.printf("[energy] trim do MTPA gravado: %+.2f graus (%s)\n",
+                  mtpaTrim * 57.2958f,
+                  prm(P_MTPA) >= 0.5f ? "ATIVO" : "inerte, MTPA desligado");
 }
 
 // Persiste o odômetro (chamada periódica do núcleo 0; grava só parado e a

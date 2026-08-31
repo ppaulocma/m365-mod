@@ -22,6 +22,7 @@
 #include "curves.h"
 #include "faultlog.h"
 #include "ota.h"
+#include "phase_current.h"
 
 static NimBLECharacteristic *s_telemChar  = nullptr;
 static NimBLECharacteristic *s_paramsChar = nullptr;
@@ -372,7 +373,21 @@ static size_t packTelemetry(uint8_t *b) {
   // Zeros medidos: dizem se o módulo INA240 é bidirecional (o app mostra).
   u16(151, (uint32_t)(constrain(t.iph_zero1, 0.0f, 5.0f) * 1000.0f));
   u16(153, (uint32_t)(constrain(t.iph_zero2, 0.0f, 5.0f) * 1000.0f));
-  return 155;
+  // 155-160: ESCALA CALIBRADA dos dois canais [A/V] e as rejeicoes de janela.
+  // A escala é o único número que diz qual shunt está REALMENTE instalado
+  // (R = 1/(ganho x escala)) — sem ela, trocar shunt vira fé. As rejeicoes
+  // são o indicador de saúde do topo: zero é o normal, subir significa que o
+  // duty encostou no teto e a janela de amostragem fechou.
+#if PHASE_CUR_ENABLED
+  const PhaseCal *pc = phaseCurrentCal();
+  u16(155, (uint32_t)constrain(pc->ampsPerVolt[0], 0.0f, 65000.0f));
+  u16(157, (uint32_t)constrain(pc->ampsPerVolt[1], 0.0f, 65000.0f));
+  u16(159, (uint32_t)(phaseCurrentRejects() > 65535 ? 65535
+                                                    : phaseCurrentRejects()));
+#else
+  u16(155, 0); u16(157, 0); u16(159, 0);
+#endif
+  return 161;
 }
 
 // Frame do STREAM de alta taxa (20 B) a partir da amostra rápida do núcleo 1
@@ -450,7 +465,7 @@ void bleDashboardTask(void *arg) {
   adv->start();
   Serial.printf("[ble] anunciando como \"%s\"\n", BLE_DEVICE_NAME);
 
-  uint8_t buf[160];   // telemetria profunda (~136 B) + stream (16 B)
+  uint8_t buf[176];   // telemetria profunda (161 B) + stream (16 B)
   uint32_t n20 = 0;
   for (;;) {
     n20++;

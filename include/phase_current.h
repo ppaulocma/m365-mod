@@ -199,6 +199,12 @@ bool phaseCurrentFresh();
 // contadores de amostras rejeitadas, latência, tabela de amostras.
 void phaseCurrentDiag(uint32_t ms);
 
+// Amostras de CORRENTE descartadas por caírem fora da janela low-side. É o
+// indicador de saúde do topo de velocidade: com o teto de operação correto
+// ele fica em ZERO, e sobe justamente quando o duty encosta no limite e a
+// janela fecha. Vai para a telemetria (o app mostra no Monitor).
+uint32_t phaseCurrentRejects();
+
 // Captura 100 ms a 4 kHz e desenha no serial (estrutura temporal do ruído).
 
 #endif  // PHASE_CUR_ENABLED
