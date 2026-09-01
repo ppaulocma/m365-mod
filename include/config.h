@@ -140,9 +140,15 @@
 // de baixo conduz. Modulação a 100% (0.577 = máximo do seno) deixa o
 // high-side ligado tempo demais no pico da senoide -> o capacitor descarrega,
 // o gate afunda e a fase falha — é o "se perde/tranca/faz barulho" perto da
-// velocidade máxima. 0.55 (~95% de duty máx.) garante ~2 µs de recarga do
-// bootstrap por ciclo de PWM. NÃO suba além de ~0.56 com este estágio.
-#define MODULATION_CEIL_FACTOR  0.55f
+// velocidade máxima.
+// 0.56 é o TETO DESTE ESTÁGIO, não uma sugestão: dá ~97% de duty máximo, o
+// que a 16 kHz deixa ~1,9 µs de condução do lado baixo por ciclo para
+// recarregar o bootstrap. Não passe daqui sem trocar o driver ou baixar a
+// frequência do PWM — acima disso o capacitor não fecha a conta.
+// Com shunt EM SÉRIE COM A FASE (IPH_INLINE) este é o ÚNICO teto que sobra:
+// a amostragem deixou de impor limite de duty, então quem define a
+// velocidade máxima é este número.
+#define MODULATION_CEIL_FACTOR  0.56f
 
 // Limite de tensão de fase aplicado ao motor (controla o "torque máximo").
 // Começa BAIXO por segurança; o valor é ajustável ao vivo pela dashboard
@@ -361,13 +367,26 @@
 
 #define IPH_OP_FOLGA_US         3.0f
 // AVANÇO DE COMUTAÇÃO default [µs] (P_COMM_LEAD no NVS vence; console
-// 'lead <us>'): compensa a latência ângulo-medido → tensão-nos-FETs (meio
-// período do loopFOC + latch do PWM + filtro de velocidade do Hall). Sem
-// compensação o vetor aplicado inclina ω·τ com a velocidade e a malha de d
-// paga a conta em Ud — a caixa-preta mediu ~5 V de Ud no topo (≈18° a
-// 135 Hz el ⇒ τ efetivo ≈370 µs). Ajuste no topo observando o duty
-// vetorial: o ótimo é o MENOR duty na mesma velocidade. Comece por 150-250.
-#define COMM_LEAD_US_DEFAULT    0.0f
+// 'lead <us>'): compensa a latência entre o ângulo medido e a tensão chegar
+// nos FETs — meio período do loopFOC, latch do PWM e filtro de velocidade do
+// Hall. Sem ele o vetor aplicado inclina ω·τ, ou seja o erro CRESCE com a
+// velocidade: liso embaixo, áspero em cima.
+//
+// MEDIÇÃO (não é chute): o 'varre' imprime, em cada faixa de RODA LIVRE, o
+// desalinhamento tirado de Ud/Vq. Com corrente ~zero não há queda resistiva
+// nem acoplamento cruzado −ω·Lq·iq, então o Ud que sobra é a componente de
+// eixo d da FCEM — desalinhamento puro do referencial de saída. Dividido por
+// ω elétrico vira ESTE número. Medir em duas velocidades separa as causas:
+// atraso de tempo dá o mesmo τ com ângulos diferentes; erro de ângulo zero
+// (P_ZEA) dá o mesmo ângulo com τ diferentes.
+//
+// 170 µs é o valor medido na bancada (01/set/2026): 167/164/189 µs em três
+// velocidades de roda livre entre 10 e 28 km/h. Levou o desalinhamento de
+// 11,7° para 0,7° a 27 km/h, o id parasita de 1,17 A para 0,23 A e o Ud sob
+// carga de −2,98 V (crescendo com a velocidade) para −0,45 V (plano).
+// ATENÇÃO: a varredura 'ang' NÃO enxerga isto — ela roda a ~6 km/h, onde
+// 170 µs são 2,2°, abaixo do seu passo de 6°.
+#define COMM_LEAD_US_DEFAULT  170.0f
 // Idade média da amostra de corrente na projeção dq [µs]. A projeção usa o
 // ângulo DO INSTANTE DA AMOSTRA (ângulo atual − ω·idade − ω·lead) — sem isso
 // o id real vaza para o iq medido (era o −4 A dos registros do topo).
@@ -376,8 +395,13 @@
 // IN-LINE são DOIS centros por período (TEP e TEZ) alternando os canais, ou
 // seja 16 kHz por canal -> I = 62,5 µs -> idade ≈ 94 µs. No low-side eram
 // 8 kHz por canal (um centro só, e metade dos eventos gastos no zero).
+// 460 e não os 95 da conta acima: medido contra corrente de bateria por
+// ampère de fase, o 460 repetiu 0,636 em duas corridas na faixa de 22 km/h
+// contra 0,668 do 95, e empatou nas faixas de baixo. A conta dá o piso do
+// atraso (ADC + mediana), não o total — sobra a estimativa de velocidade do
+// Hall e a fatia de 1 kHz, que não têm fórmula fechada aqui.
 #if IPH_INLINE
-#define IPH_MEAS_AGE_US          95.0f
+#define IPH_MEAS_AGE_US         460.0f
 #else
 #define IPH_MEAS_AGE_US         125.0f
 #endif
@@ -654,7 +678,12 @@
                                        // os endereços no serial (p/ achar o INA226);
                                        // ponha o valor achado no INA226_ADDR e volte a 0
 #define INA226_ADDR             0x44   // A0 e A1 no GND
-#define INA226_SHUNT_MOHM       1.950f // [mΩ] resistência REAL do shunt (calibrado)
+// [mΩ] resistência REAL do shunt do INA226. Não é só o medidor de bateria:
+// é a REFERÊNCIA contra a qual a calibração da corrente de FASE deriva a
+// escala de cada canal (I_fase = I_bus/duty). Errado aqui, toda a escala de
+// corrente do sistema sai errada junto — trip, orçamento do FW e torque por
+// ampère. 3.6 mΩ é o valor conferido pela fonte de bancada.
+#define INA226_SHUNT_MOHM       3.600f
 #define PIN_I2C_SDA             21
 #define PIN_I2C_SCL             22
 #define CUR_INVERT              0      // 1 se a corrente positiva aparecer negativa
