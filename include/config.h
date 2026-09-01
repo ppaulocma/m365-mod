@@ -323,6 +323,42 @@
 // vira exceção de 1 amostra (62 µs), nunca arco cego. Custo: ~8% de tensão
 // de topo (≈2 km/h com pack cheio) — o preço de medir de verdade a 100% do
 // punho, que é onde o limitador de corrente mais importa.
+// ---------------------------------------------------------------------------
+// TOPOLOGIA DO SHUNT — 1 = EM SÉRIE COM A FASE (in-line) | 0 = low-side
+// ---------------------------------------------------------------------------
+// Muda TRÊS coisas, e as três são consequência de um fato só: com o shunt em
+// série com a fase a corrente passa por ele o tempo TODO, e não só enquanto o
+// MOSFET de baixo conduz.
+//
+//  1) NÃO EXISTE MAIS TETO DE DUTY POR AMOSTRAGEM. No low-side a amostra tem
+//     de caber na janela LOW, que encolhe quando o duty sobe — era isso que
+//     limitava a modulação em 0,45 (contra 0,55 do bootstrap) e o que fazia a
+//     amostra ser descartada perto do topo. In-line a corrente vale a MÉDIA
+//     do período tanto no centro da janela LOW (TEP) quanto no centro da HIGH
+//     (TEZ) — a ondulação é um triângulo simétrico e nos dois centros ela
+//     cruza a média. Como duty + (1−duty) = 1, uma das duas metades SEMPRE
+//     tem pelo menos T/4: a ISR escolhe por canal, por período, a que tiver
+//     espaço, e não sobra duty inalcançável.
+//
+//  2) O ZERO NÃO SAI MAIS DO TEZ. O zero vivo dependia de um instante em que
+//     a corrente é ZERO POR CONSTRUÇÃO (low FET aberto). In-line esse
+//     instante não existe com o motor andando. O substituto é a média longa:
+//     corrente de fase não tem componente contínua, então a média de muitas
+//     voltas elétricas converge para o offset (ver IPH_ZERO_SPIN_*).
+//
+//  3) O MODO COMUM vira o erro dominante. Os dois pinos do INA240 balançam
+//     0↔Vbat a cada chaveamento; casamento das entradas e sensoriamento
+//     Kelvin passam a decidir a qualidade da medida.
+#define IPH_INLINE              1
+
+// Rastreio do zero COM O MOTOR GIRANDO (só existe no in-line). Constante de
+// tempo LONGA de propósito: ela precisa cobrir muitas voltas elétricas para
+// que a média da corrente seja realmente nula. E só age acima de uma
+// frequência elétrica mínima — parado com torque a corrente É contínua, e
+// aprender essa média como zero seria aprender a própria corrente.
+#define IPH_ZERO_SPIN_TAU_S     3.0f   // [s] constante de tempo da média
+#define IPH_ZERO_SPIN_MIN_HZ    8.0f   // [Hz] frequência elétrica mínima
+
 #define IPH_OP_FOLGA_US         3.0f
 // AVANÇO DE COMUTAÇÃO default [µs] (P_COMM_LEAD no NVS vence; console
 // 'lead <us>'): compensa a latência ângulo-medido → tensão-nos-FETs (meio
@@ -332,11 +368,19 @@
 // 135 Hz el ⇒ τ efetivo ≈370 µs). Ajuste no topo observando o duty
 // vetorial: o ótimo é o MENOR duty na mesma velocidade. Comece por 150-250.
 #define COMM_LEAD_US_DEFAULT    0.0f
-// Idade média da amostra de corrente na projeção dq [µs]: centro da
-// mediana-de-3 + alternância de canais a 8 kHz/canal. A projeção usa o
-// ângulo DO INSTANTE DA AMOSTRA (ângulo atual − ω·idade − ω·lead) — sem
-// isso o id real vaza para o iq medido (era o −4 A dos registros do topo).
+// Idade média da amostra de corrente na projeção dq [µs]. A projeção usa o
+// ângulo DO INSTANTE DA AMOSTRA (ângulo atual − ω·idade − ω·lead) — sem isso
+// o id real vaza para o iq medido (era o −4 A dos registros do topo).
+// Conta, com o intervalo I entre amostras DO MESMO canal:
+//     idade = I/2 (a fatia lê num instante qualquer) + I (centro da mediana-3)
+// IN-LINE são DOIS centros por período (TEP e TEZ) alternando os canais, ou
+// seja 16 kHz por canal -> I = 62,5 µs -> idade ≈ 94 µs. No low-side eram
+// 8 kHz por canal (um centro só, e metade dos eventos gastos no zero).
+#if IPH_INLINE
+#define IPH_MEAS_AGE_US          95.0f
+#else
 #define IPH_MEAS_AGE_US         125.0f
+#endif
 // ---- PRÉ-DISPARO da amostra de corrente (o rework "definitivo") ------------
 // Geometria antiga: a conversão disparava NO evento TEP (centro da janela
 // low-side) e TODO o orçamento (latência da ISR + setup + S&H + margem,

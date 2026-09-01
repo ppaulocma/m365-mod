@@ -1,9 +1,32 @@
 // ============================================================================
-// phase_current.h — corrente de FASE medida (2x INA240A1, shunts low-side)
+// phase_current.h — corrente de FASE medida (2x INA240A1)
 // ----------------------------------------------------------------------------
-// Reescrito do zero. O desenho segue o que controladoras de verdade (VESC,
-// ODrive, ST MC SDK) fazem com shunt low-side, adaptado ao hardware do ESP32
-// clássico (UM SAR ADC, sem trigger de hardware, sem dupla amostragem):
+// DUAS TOPOLOGIAS, uma chave: IPH_INLINE no config.h.
+//
+//   IPH_INLINE = 1 (o hardware ATUAL): shunt EM SÉRIE COM A FASE. A corrente
+//   atravessa o shunt o tempo todo. Consequências, que são o desenho inteiro:
+//     - Amostra em DOIS centros por período, TEP e TEZ. A ondulação de
+//       chaveamento é um triângulo simétrico, e nos DOIS centros ela cruza a
+//       própria média — os dois instantes valem igual. A ISR escolhe, por
+//       canal e por período, o centro que tiver espaço. Como as duas metades
+//       somam o período, a maior nunca é menor que T/4: a AMOSTRAGEM DEIXA DE
+//       IMPOR TETO DE DUTY. Quem limita a modulação passa a ser só o
+//       bootstrap do driver (P_MODCEIL).
+//     - NÃO existe mais o zero amostrado no TEZ: lá agora passa corrente. O
+//       zero vem de duas fontes que se cobrem — média longa COM O MOTOR
+//       GIRANDO (corrente de fase não tem componente contínua) e amostra
+//       direta em repouso com a roda parada. Ver phaseCurrentTrackZeroSpin().
+//     - O MODO COMUM vira o erro dominante: os dois pinos do INA240 balançam
+//       0↔Vbat a cada borda. Casamento das entradas e Kelvin no shunt passam
+//       a decidir a qualidade da medida — 30 mV de sinal (30 A x 1 mΩ) em
+//       cima de uma onda quadrada de 42 V é 1:1400.
+//
+//   IPH_INLINE = 0: shunt LOW-SIDE, o desenho descrito abaixo. Mantido
+//   compilável para comparação e para voltar atrás sem arqueologia.
+//
+// O desenho segue o que controladoras de verdade (VESC, ODrive, ST MC SDK)
+// fazem, adaptado ao hardware do ESP32 clássico (UM SAR ADC, sem trigger de
+// hardware, sem dupla amostragem). Da topologia LOW-SIDE:
 //
 //   1) PWM center-aligned. O driver MCPWM da SimpleFOC configura os três
 //      timers em contador UP-DOWN sincronizados no TEZ do timer 0, duty mode
@@ -15,7 +38,7 @@
 //      corrente ali vale exatamente a sua MÉDIA no período — o ripple de
 //      chaveamento se cancela sozinho, sem filtro.
 //
-//   2) ZERO VIVO, medido por período — a correção de offset que as camadas
+//   2) [SÓ LOW-SIDE] ZERO VIVO, medido por período — a correção de offset que as camadas
 //      antigas (canal de referência no GPIO36, rastreio por variância,
 //      mediana, âncoras) tentavam imitar. No TEZ o MOSFET de baixo está
 //      DESLIGADO (janela high-side): não passa corrente pelo shunt e a saída
@@ -45,14 +68,16 @@
 //      regime), com Tf = P_CUR_TF.
 //
 // CADEIA DE MEDIÇÃO
-//   shunt low-side -> INA240A1 (REF = V+/2) -> ADC1 (GPIO 34/39)
+//   shunt (em série com a fase, ou low-side) -> INA240A1 (REF = V+/2)
+//     -> ADC1 (GPIO 34/39)
 //   ISR do MCPWM nos DOIS eventos do timer 0 (TEZ e TEP), nível 3 (preempta
 //   as ISRs de Hall — o instante do S&H não pode esperar por elas), em
 //   PIPELINE: cada evento colhe a conversão disparada no evento anterior e
 //   dispara a próxima. Rodízio: TEP corrente ch0 | TEZ zero ch0 | TEP
 //   corrente ch1 | TEZ zero ch1. Cada canal: corrente E zero a 8 kHz.
 //
-// A JANELA DE AMOSTRAGEM — a conta certa
+// A JANELA DE AMOSTRAGEM — a conta certa (LOW-SIDE; in-line usa a mesma
+// aritmética, mas contra a metade ESCOLHIDA, e por isso não gera teto)
 //   O S&H acontece DEPOIS do evento (latência de ISR + disparo), então só a
 //   METADE da janela após o evento está disponível:
 //       (1 − duty)·T/2  >=  t_latencia + t_sh + margem
@@ -180,6 +205,14 @@ void phaseCurrentRead(PhaseCur *out, float angleEl);
 // usado ao habilitar o motor — o último instante de corrente comprovadamente
 // nula antes de a malha assumir.
 void phaseCurrentTrackZero(float dt, bool snap);
+
+#if IPH_INLINE
+// Rastreio do zero COM O MOTOR GIRANDO (in-line). Chamar na fatia de controle
+// passando a frequência ELÉTRICA em Hz; ele mesmo decide se está rápido o
+// bastante. Substitui o zero amostrado no TEZ, que só existe com shunt
+// low-side. Ver o comentário longo na implementação.
+void phaseCurrentTrackZeroSpin(float dt, float fElecHz);
+#endif
 
 // true = o zero vivo saiu do cerco físico em torno do zero da calibração.
 // Não é deriva (o cerco é largo): é canal morto, em curto ou desligado.

@@ -107,6 +107,7 @@ static volatile uint32_t s_curSeq[2]  = { 0, 0 };
 // rajadas do rádio, cortando o ruído de uma amostra por ~5,6x)
 static volatile uint32_t s_zeroAcc[2] = { 2047u << 6, 2047u << 6 };
 static volatile uint32_t s_zeroSeq[2] = { 0, 0 };
+static volatile uint8_t  s_curGap[2]  = { 0, 0 };   // centros sem amostra
 
 // conversão em voo (disparada no evento anterior)
 static volatile uint8_t  s_ifKind = KIND_NONE;
@@ -138,16 +139,147 @@ static bool              s_zeroPinned = false;
 static bool              s_clipping   = false;
 static bool              s_isrLevel3  = false;  // ISR conseguiu o nível 3?
 
+// MEDIANA DE 3 por canal: o SAR do ESP32 solta spikes isolados de dezenas de
+// contagens (comportamento conhecido do silício). Um impulso isolado morre
+// inteiro na mediana; sinal real (<=200 Hz amostrado a 8-16 kHz) e monotonico
+// entre amostras e atravessa intacto.
+static inline void IRAM_ATTR pushCur(uint8_t k, uint16_t v) {
+  const uint16_t a = s_curM3[k][0], b = s_curM3[k][1];
+  s_curM3[k][0] = b;
+  s_curM3[k][1] = v;
+  s_curRaw[k] = (a > b) ? ((b > v) ? b : ((a > v) ? v : a))
+                        : ((a > v) ? a : ((b > v) ? v : b));
+  s_curSeq[k] = s_curSeq[k] + 1;
+}
+
 // ---------------------------------------------------------------------------
 // ISR — colhe a conversão anterior, valida e dispara a próxima. Só inteiros.
 // ---------------------------------------------------------------------------
 static void IRAM_ATTR mcpwmIsr(void *) {
+#if IPH_INLINE && !IPH_PRETRIG_ENABLE
+#error "IPH_INLINE exige IPH_PRETRIG_ENABLE: sem o pre-disparo a ISR cai na geometria low-side, que amostra ZERO no TEZ — e com o shunt em serie o TEZ tem CORRENTE. O zero viraria a propria corrente."
+#endif
+
+#if IPH_INLINE
+  // ===== GEOMETRIA IN-LINE =================================================
+  // Dois pré-disparos por período, um antes de cada centro:
+  //   compare B do operador 0, em (periodo − pretrig)  -> vale SUBINDO  (TEP)
+  //   compare B do operador 1, em (pretrig)            -> vale DESCENDO (TEZ)
+  // Cada compare cruza duas vezes por período; a direção errada sai fora
+  // logo na entrada, custando poucas centenas de nanossegundos.
+  // Não há mais evento de ZERO: com o shunt em série não existe instante de
+  // corrente nula garantida (ver IPH_INLINE no config).
+  if (s_pretrig) {
+    const uint32_t stTep = s_dev->int_st.op0_teb_int_st;
+    const uint32_t stTez = s_dev->int_st.op1_teb_int_st;
+    if (!(stTep | stTez)) {
+      // NÃO É NOSSO EVENTO — mas a linha está asserted, senão a ISR não teria
+      // sido chamada. Sair daqui sem limpar deixa a fonte pendente e a ISR
+      // RE-ENTRA PARA SEMPRE: foi um "Interrupt wdt timeout on CPU1" na
+      // bancada, com o TEZ legado ainda habilitado na janela de armação.
+      // Limpa exatamente o que estiver pendente e sai.
+      s_dev->int_clr.val = s_dev->int_st.val;
+      return;
+    }
+    if (stTep && stTez) {          // atraso de meio período: recomeça limpo
+      s_dev->int_clr.op0_teb_int_clr = 1;
+      s_dev->int_clr.op1_teb_int_clr = 1;
+      s_ifKind = KIND_NONE;
+      s_rejBoth = s_rejBoth + 1;
+      return;
+    }
+    if (stTep) {
+      s_dev->int_clr.op0_teb_int_clr = 1;
+      if (s_dev->timer[0].timer_status.timer_direction) return;   // descendo
+    } else {
+      s_dev->int_clr.op1_teb_int_clr = 1;
+      if (!s_dev->timer[0].timer_status.timer_direction) return;  // subindo
+    }
+
+    // ---- colhe a conversão do evento anterior ----------------------------
+    if (s_ifKind != KIND_NONE) {
+      uint16_t v;
+      if (adcResult(&v)) { if (s_ifOk) pushCur(s_ifCh, v); }
+      else               s_rejNotReady = s_rejNotReady + 1;
+      s_ifKind = KIND_NONE;
+    }
+
+    // ---- valida e dispara a próxima --------------------------------------
+    // Uma leitura só de timer_status entrega contagem E direção sem corrida.
+    const uint32_t stv = s_dev->timer[0].timer_status.val;
+    const bool nowDown = (stv & (1u << 16)) != 0;
+    const uint32_t cnt = stv & 0xFFFFu;
+    // ttc = ticks ATÉ o centro, COM SINAL. Positivo = o centro ainda vem;
+    // NEGATIVO = ele já passou (a colheita demorou).
+    //
+    // Passar do centro NÃO estraga a amostra: a janela é simétrica em torno
+    // dele, então cair 1 µs depois vale o mesmo que cair 1 µs antes. Quem
+    // decide é o portão abaixo, que já trabalha com distância com sinal. A
+    // versão anterior descartava tudo que passasse do centro e jogava fora
+    // 13,7% das amostras (4,1 M de "atrasadas" no diag da bancada) — e jogava
+    // fora justamente sob carga, quando a ISR disputa CPU e a medida importa.
+    // O contador continua, agora só como diagnóstico.
+    const uint32_t dist = stTep ? (s_period - cnt) : cnt;
+    const bool passou = stTep ? nowDown : !nowDown;
+    if (passou) s_rejLate = s_rejLate + 1;
+    const int32_t ttc = passou ? -(int32_t)dist : (int32_t)dist;
+    // Mesmo par de condições do low-side, só que a "janela" agora é a metade
+    // do período em que o S&H tem de caber: LOW (periodo − compare) para a
+    // amostra no TEP, HIGH (compare) para a amostra no TEZ.
+    int32_t needClose = (int32_t)(s_shEndTk + s_marginTk) - ttc;
+    int32_t needOpen  = ttc + (int32_t)s_marginTk - (int32_t)s_shStartTk;
+    int32_t need = (needClose > needOpen) ? needClose : needOpen;
+    if (need < 0) need = 0;
+
+    // CONTABILIDADE DE PERDA. Um canal não caber NESTE centro não é perda: no
+    // in-line cada canal tem o SEU centro (duty baixo -> TEP, duty alto ->
+    // TEZ) e não caber no outro é o funcionamento normal. Contar isso encheu
+    // o diag de 16 MILHÕES de "rejeições" com o motor parado — onde todos os
+    // duties são 0 e portanto NENHUM canal cabe no TEZ, sempre.
+    // E quando os DOIS canais querem o mesmo centro (duty extremo nas duas
+    // fases medidas, ex. motor parado) eles têm de dividi-lo, o que já custa
+    // um período. Perda de verdade é passar de DOIS períodos sem amostra.
+    for (int k = 0; k < 2; k++)
+      if (++s_curGap[k] >= 5) { s_rejCur = s_rejCur + 1; s_curGap[k] = 0; }
+
+    const uint8_t k0 = s_curNext;
+    for (int t = 0; t < 2; t++) {
+      const uint8_t k = (uint8_t)(k0 ^ t);
+      const uint8_t p = s_zeroPhase[k];
+      uint32_t c;
+      if (p <= 2) {
+        c = s_dev->operators[p].timestamp[0].gen;
+      } else {
+        // Sem calibração (mapa desconhecido): pior caso das três fases —
+        // o maior compare encolhe a janela LOW, o menor encolhe a HIGH.
+        c = s_dev->operators[0].timestamp[0].gen;
+        const uint32_t c1 = s_dev->operators[1].timestamp[0].gen;
+        const uint32_t c2 = s_dev->operators[2].timestamp[0].gen;
+        if (stTep) { if (c1 > c) c = c1; if (c2 > c) c = c2; }
+        else       { if (c1 < c) c = c1; if (c2 < c) c = c2; }
+      }
+      const uint32_t halfWin = stTep ? (s_period - c) : c;
+      if ((uint32_t)need < halfWin) {
+        adcStartCh(s_ch[k]);
+        s_ifKind = KIND_CUR; s_ifCh = k; s_ifOk = 1;
+        s_curGap[k] = 0;
+        s_curNext = (uint8_t)(k ^ 1);
+        return;
+      }
+    }
+    return;   // este centro não serve a nenhum dos dois; o outro serve
+  }
+#endif  // IPH_INLINE
+
   const uint32_t stTez = s_dev->int_st.timer0_tez_int_st;
   // Evento de CORRENTE: com o pré-disparo armado é o compare B do operador 0
   // (cruzamento ANTES do TEP — ver config); na geometria legada é o TEP.
   const uint32_t stCur = s_pretrig ? s_dev->int_st.op0_teb_int_st
                                    : s_dev->int_st.timer0_tep_int_st;
-  if (!(stTez | stCur)) return;                 // não é nosso
+  if (!(stTez | stCur)) {                       // não é nosso
+    s_dev->int_clr.val = s_dev->int_st.val;     // ver o comentário acima
+    return;
+  }
 
   if (stTez && stCur) {
     // Atraso de um evento inteiro (>31 µs): perdemos a referência de tempo da
@@ -178,20 +310,7 @@ static void IRAM_ATTR mcpwmIsr(void *) {
       if (s_ifOk) {
         const uint8_t k = s_ifCh;
         if (s_ifKind == KIND_CUR) {
-          // MEDIANA DE 3 por canal: o SAR do ESP32 solta spikes isolados de
-          // dezenas de contagens (comportamento conhecido do silício — a
-          // análise de ruído mediu ~7% das amostras num pedestal de ±30 cnt
-          // sem chaveamento e sem rádio). Um impulso isolado morre inteiro
-          // na mediana; sinal real (≤200 Hz amostrado a 8 kHz) é monotônico
-          // entre amostras e atravessa intacto. Custo: ~1 amostra (125 µs)
-          // de atraso — nada contra o filtro dq de 2 ms.
-          const uint16_t a = s_curM3[k][0], b = s_curM3[k][1];
-          s_curM3[k][0] = b;
-          s_curM3[k][1] = v;
-          const uint16_t m = (a > b) ? ((b > v) ? b : ((a > v) ? v : a))
-                                     : ((a > v) ? a : ((b > v) ? v : b));
-          s_curRaw[k] = m;
-          s_curSeq[k] = s_curSeq[k] + 1;
+          pushCur(k, v);
         } else {
           // EMA inteira do zero vivo (<<6, alpha 1/16), com DUAS guardas de
           // contaminação (ver config, "GUARDAS DO ZERO VIVO"): offset é
@@ -474,6 +593,50 @@ bool phaseCurrentClipping()   { return s_clipping; }
 // Escreve no MESMO acumulador da ISR; não há corrida porque a ISR só escreve
 // nele quando há janela high-side (duty > 0), e este caminho só roda com
 // duty 0 — os dois estados são mutuamente exclusivos por construção.
+#if IPH_INLINE
+// ---------------------------------------------------------------------------
+// Rastreio do zero COM O MOTOR GIRANDO — o substituto do zero no TEZ
+// ---------------------------------------------------------------------------
+// O zero vivo do low-side vinha de uma garantia GEOMÉTRICA: no TEZ o MOSFET de
+// baixo está aberto, então a corrente pelo shunt é zero por construção e o que
+// o INA240 mostra ali é exatamente o offset. Com o shunt EM SÉRIE COM A FASE
+// esse instante não existe — a corrente atravessa o shunt o tempo inteiro.
+//
+// O que substitui a garantia geométrica é uma propriedade do motor: a corrente
+// de fase NÃO TEM COMPONENTE CONTÍNUA. Numa volta elétrica ela passa tanto
+// tempo positiva quanto negativa, com qualquer torque, em qualquer velocidade.
+// Então a média longa da leitura CRUA de cada canal converge para o offset
+// daquele canal — e só para ele.
+//
+// Duas condições, as duas obrigatórias:
+//   - a média tem de cobrir MUITAS voltas elétricas, senão sobra resíduo da
+//     própria senoide dentro do "zero";
+//   - o motor tem de estar GIRANDO. PARADO com torque a corrente de fase é
+//     contínua de verdade, e aprender essa média como zero seria aprender a
+//     CORRENTE — o erro mais perigoso possível aqui, porque volta depois como
+//     corrente fantasma permanente. Quem cobre o repouso é a função abaixo.
+// O cerco físico em torno do zero da calibração continua valendo por cima:
+// mesmo enganada, a média não sai da banda.
+void phaseCurrentTrackZeroSpin(float dt, float fElecHz) {
+  if (!s_ready || !s_cal.zeroed) return;
+  if (!(fElecHz >= IPH_ZERO_SPIN_MIN_HZ)) return;      // NaN cai aqui também
+  // τ efetivo: nunca menos que 16 voltas elétricas, para o resíduo da
+  // fundamental na média ficar bem abaixo de uma contagem de ADC.
+  const float tau = fmaxf(IPH_ZERO_SPIN_TAU_S, 16.0f / fElecHz);
+  const float a   = fminf(fminf(dt, 0.02f) / tau, 1.0f);
+  for (int k = 0; k < 2; k++) {
+    const float accf = (float)s_zeroAcc[k];             // escala <<6
+    const float tgt  = (float)s_curRaw[k] * 64.0f;
+    float na = accf + a * (tgt - accf);
+    const float lo = (float)s_zeroRef64[k] - (float)(IPH_ZERO_LIVE_BAND_CNT << 6);
+    const float hi = (float)s_zeroRef64[k] + (float)(IPH_ZERO_LIVE_BAND_CNT << 6);
+    if (na < lo) na = lo; else if (na > hi) na = hi;
+    s_zeroAcc[k] = (uint32_t)(na + 0.5f);
+    s_zeroSeq[k] = s_zeroSeq[k] + 1;      // o 'diag' conta por aqui agora
+  }
+}
+#endif
+
 void phaseCurrentTrackZero(float dt, bool snap) {
   if (!s_ready || !s_cal.zeroed) return;
   dt = fminf(dt, 0.010f);
@@ -523,10 +686,20 @@ static void refresh() {
   }
 }
 
+// VERSÃO da calibração na NVS. Ela é AMARRADA À TOPOLOGIA do shunt, e isso é
+// segurança, não organização: uma calibração low-side aplicada a shunt em
+// série traz a ESCALA errada (o shunt mudou de valor) e, pior, pode trazer o
+// SINAL errado — no low-side mede-se a corrente de RETORNO pelo FET de baixo,
+// em série mede-se a corrente da fase, e as duas podem ter sentidos opostos.
+// Sinal invertido na realimentação de corrente é realimentação POSITIVA: a
+// malha empurra para o lado do erro e dispara. Trocar a topologia portanto
+// invalida a calibração e o firmware bloqueia o motor até 'cal' rodar de novo.
+#define IPH_CAL_NVS_VER   (IPH_INLINE ? 3 : 2)
+
 static void calLoad() {
   s_nvs.begin("iphase", true);
   const uint8_t ver = s_nvs.getUChar("ver", 0);
-  if (ver != 2) {
+  if (ver != IPH_CAL_NVS_VER) {
     const bool hadV1 = s_nvs.isKey("ok");
     s_nvs.end();
     s_cal = PhaseCal{};
@@ -535,9 +708,11 @@ static void calLoad() {
       s_cal.offset[k] = 1.65f; s_cal.zeroRef[k] = 1.65f;
     }
     if (hadV1)
-      Serial.println("[iphase] calibracao antiga na NVS DESCARTADA: o "
-                     "sensoriamento foi reescrito — recalibre (comando 26, "
-                     "roda suspensa).");
+      Serial.printf("[iphase] calibracao da NVS DESCARTADA (versao %u, "
+                    "esperada %u): topologia de shunt ou sensoriamento "
+                    "mudaram. O motor fica BLOQUEADO ate rodar 'cal' com a "
+                    "roda suspensa — escala e SINAL precisam ser medidos de "
+                    "novo.\n", (unsigned)ver, (unsigned)IPH_CAL_NVS_VER);
     refresh();
     return;
   }
@@ -556,13 +731,22 @@ static void calLoad() {
       s_cal.valid = false;
   }
   s_nvs.end();
+#if IPH_INLINE
+  // IN-LINE não tem evento "certo" e evento "errado": a corrente atravessa o
+  // shunt nos DOIS centros, e a ISR usa os dois de propósito. Um s_cal.event
+  // herdado de uma calibração low-side antiga (valendo 1 = TEZ) deixaria o
+  // pré-disparo sem armar e a geometria cairia no caminho legado — que
+  // amostraria "zero" onde agora passa corrente. Fixado em 0.
+  s_evCur = 0;
+#else
   s_evCur = s_cal.event;
+#endif
   refresh();
 }
 
 static void calSave() {
   s_nvs.begin("iphase", false);
-  s_nvs.putUChar("ver", 2);
+  s_nvs.putUChar("ver", IPH_CAL_NVS_VER);
   s_nvs.putBool("ok", s_cal.valid);
   s_nvs.putUChar("ev", s_cal.event);
   s_nvs.putBool("zr", s_cal.zeroed);
@@ -653,6 +837,12 @@ CurrentSense *phaseCurrentInit(BLDCDriver *drv, BLDCMotor *mot) {
   // registrador e desfazia a trava (a bancada mediu o resultado: 6-14% das
   // amostras com caudas de ±50 cnt e picos de -213 no GPIO39).
   adc_power_acquire();
+  // adc_power_acquire() SOZINHO nem sempre deixa FORCE_XPD_SAR em 3 (o boot
+  // mediu 0 logo depois de chamá-lo). Quem garante é a escrita direta — a
+  // mesma que phaseCurrentSarPowerAssert() faz depois de cada rajada do ADC2.
+  // Sem ela a amostragem começa com a errata GPIO-3.11 ativa até a primeira
+  // reafirmação, e é justamente aí que a calibração costuma rodar.
+  phaseCurrentSarPowerAssert();
   Serial.printf("[iphase] SAR power: FORCE_XPD_SAR=%lu (3 = travado LIGADO; "
                 "0 = FSM alternando = errata ativa)\n",
                 (unsigned long)GET_PERI_REG_BITS2(SENS_SAR_MEAS_WAIT2_REG,
@@ -739,11 +929,29 @@ CurrentSense *phaseCurrentInit(BLDCDriver *drv, BLDCMotor *mot) {
     // só serve ao nosso interrupt. Escrita imediata (upmethod 0) e estática.
     s_dev->operators[0].gen_stmp_cfg.gen_b_upmethod = 0;
     s_dev->operators[0].timestamp[1].gen = s_period - pretrig;
+    // ORDEM IMPORTA. As fontes antigas saem de cena ANTES de s_pretrig virar
+    // true: entre uma coisa e outra a ISR já usa a geometria nova, e um TEZ
+    // (16 kHz!) que chegue nessa fresta cai num caminho que não sabe limpá-lo.
     s_dev->int_ena.timer0_tep_int_ena = 0;      // TEP sai de cena
     s_dev->int_clr.timer0_tep_int_clr = 1;
+#if IPH_INLINE
+    s_dev->int_ena.timer0_tez_int_ena = 0;      // TEZ/zero sai de cena
+    s_dev->int_clr.timer0_tez_int_clr = 1;
+#endif
     s_dev->int_clr.op0_teb_int_clr    = 1;
     s_pretrig = true;                            // a ISR muda de geometria
     s_dev->int_ena.op0_teb_int_ena    = 1;
+#if IPH_INLINE
+    // SEGUNDO pré-disparo, antes do TEZ: compare B do operador 1 (gerador
+    // sem pino nem ação, igual ao do operador 0 — o valor só serve ao nosso
+    // interrupt). Com os dois centros disponíveis, a amostra sempre tem para
+    // onde ir: o TEZ deixa de ser o evento do zero e vira o segundo instante
+    // de CORRENTE.
+    s_dev->operators[1].gen_stmp_cfg.gen_b_upmethod = 0;
+    s_dev->operators[1].timestamp[1].gen = pretrig;
+    s_dev->int_clr.op1_teb_int_clr    = 1;
+    s_dev->int_ena.op1_teb_int_ena    = 1;
+#endif
     // Tetos da geometria nova: com o S&H centrado no TEP, o requisito de
     // meia-janela nominal é max(fechamento, abertura) — o mesmo par de
     // condições que o portão checa por amostra na ISR.
@@ -752,9 +960,32 @@ CurrentSense *phaseCurrentInit(BLDCDriver *drv, BLDCMotor *mot) {
                        + PHASE_ISR_MARGIN_US - ttp0;
     const float openN  = ttp0 + PHASE_ISR_MARGIN_US - IPH_SAR_SETUP_US;
     const float needN  = fmaxf(closeN, openN);
+#if IPH_INLINE
+    // IN-LINE: o requisito de meia-janela vale para O CENTRO ESCOLHIDO, e a
+    // ISR escolhe o que tiver espaço. Como as duas metades somam o período,
+    // a maior nunca é menor que T/4 — e T/4 (15,6 µs a 16 kHz) é folgado
+    // demais para o requisito de ~5 µs. Ou seja: a AMOSTRAGEM não impõe mais
+    // teto nenhum de duty. Quem passa a mandar é o bootstrap (P_MODCEIL).
+    // O 0,98 aqui é só para não prometer 100% de duty ao resto do código.
+    const float dutyLim = (needN * 2.0f < tHalfUs) ? 0.98f
+                        : constrain(1.0f - (needN + 1.0f) / tHalfUs, 0.50f, 0.98f);
+    s_dutyMax = dutyLim;
+    s_dutyOp  = dutyLim;
+#else
     s_dutyMax = constrain(1.0f - (needN + 1.0f) / tHalfUs, 0.50f, 0.95f);
     s_dutyOp  = constrain(1.0f - (needN + IPH_OP_FOLGA_US) / tHalfUs,
                           0.40f, s_dutyMax);
+#endif
+#if IPH_INLINE
+    Serial.printf("[iphase] IN-LINE: pre-disparo DUPLO %.2f us antes de CADA "
+                  "centro (TEP e TEZ) | requisito de meia-janela %.1f us "
+                  "contra T/4 = %.1f us -> amostragem NAO limita mais o duty "
+                  "(quem manda e o bootstrap, P_MODCEIL)\n",
+                  pretrig / s_ticksPerUs, needN, tHalfUs * 0.5f);
+    Serial.println("[iphase] IN-LINE: zero vivo do TEZ DESLIGADO — o zero "
+                   "passa a sair da media longa girando (>=8 Hz eletricos) e "
+                   "do repouso com a roda parada.");
+#endif
     Serial.printf("[iphase] PRE-DISPARO armado: compare B %.2f us antes do "
                   "TEP | S&H nominal %+.1f..%+.1f us do TEP | requisito de "
                   "meia-janela %.1f us (era %.1f)\n",
@@ -996,6 +1227,16 @@ bool phaseCurrentCalibrate() {
   s_evCur = 0;                                  // corrente no TEP (normal)
   delay(20);
   if (!calSweep(volts, &best, &maxI)) aborted = true;
+#if IPH_INLINE
+  // Sem sondagem do evento oposto: com o shunt em série a corrente responde
+  // nos dois centros por construção, então "não respondeu no TEP" só pode ser
+  // canal morto, fiação errada ou o motor não girando — nunca polaridade de
+  // PWM. Sondar o TEZ aqui só produziria um diagnóstico falso.
+  if (!aborted && best < minV)
+    Serial.println("[iphase] sem resposta no TEP. Com shunt EM SERIE isso nao "
+                   "e polaridade de PWM: confira fiacao do shunt, do INA240 e "
+                   "se o motor realmente girou.");
+#else
   if (!aborted && best < minV) {
     Serial.println("[iphase] sem resposta no TEP — verificando o evento oposto "
                    "(isto NAO deveria acontecer com o driver atual)");
@@ -1007,6 +1248,7 @@ bool phaseCurrentCalibrate() {
                      "PWM esta INVERTIDA em relacao ao driver conhecido. "
                      "Confira a versao da SimpleFOC.");
   }
+#endif
   bool found = !aborted && best >= minV;
   if (found) s_cal.event = s_evCur;
 #if IPH_PRETRIG_ENABLE

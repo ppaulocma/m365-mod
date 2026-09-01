@@ -239,6 +239,14 @@ static void benchConsole() {
                     prm(P_UD_MAX), prm(P_UD_MAX) * 100.0f);
       continue;
     }
+    // 'age <us>' — atraso TOTAL da medida de corrente contra o angulo usado
+    // na projecao dq. Varra ate o id medido ficar ~0 em toda a faixa (FW
+    // desligado). Ver P_MEAS_AGE em params.h.
+    else if (!strncmp(buf, "age ", 4)) {
+      paramSet(P_MEAS_AGE, atof(buf + 4));
+      Serial.printf("[con] P_MEAS_AGE = %.0f us — 'save' para gravar\n",
+                    prm(P_MEAS_AGE));
+    }
     else if (!strncmp(buf, "lead ", 5)) {
       paramSet(P_COMM_LEAD, atof(buf + 5));
       Serial.printf("[con] P_COMM_LEAD = %.0f us — 'save' para gravar\n",

@@ -61,6 +61,8 @@ static HallSensor      hallSensor(PIN_HALL_A, PIN_HALL_B, PIN_HALL_C, MOTOR_POLE
 // foi travada (aceleração), sobra um passinho para FRENTE limitado — nunca o
 // salto para trás da implementação antiga.
 // ---------------------------------------------------------------------------
+// Atraso total da medida [µs] — cache de P_MEAS_AGE (ver params.h)
+static volatile float s_measAgeUs = IPH_MEAS_AGE_US;
 // Avanço de comutação vivo [µs] — cache de P_COMM_LEAD atualizado na fatia
 // (o update() do sensor roda no loop rápido; leitura de float é atômica).
 static float s_commLeadUs = COMM_LEAD_US_DEFAULT;
@@ -1042,7 +1044,7 @@ static void controlSlice(float dt) {
   // vazamento id→iq de ~−4 A dos registros do topo).
   phaseCurrentRead(&s_iph, motor.electrical_angle -
                    motor.shaft_velocity * (float)MOTOR_POLE_PAIRS *
-                   ((s_commLeadUs + IPH_MEAS_AGE_US) * 1e-6f));
+                   ((s_commLeadUs + s_measAgeUs) * 1e-6f));
   s_iphMagFilt += 0.3f * (s_iph.imag - s_iphMagFilt);        // τ~3 ms
   s_iphMagDisp += (dt / IPH_DISP_TAU_S) * (s_iph.imag - s_iphMagDisp);
 
@@ -1068,7 +1070,20 @@ static void controlSlice(float dt) {
     else if (stillMs < 60000)   { stillMs += (uint32_t)(dt * 1000.0f + 0.5f); }
     s_wheelStill = (stillMs >= IPH_ZERO_STILL_MS);
   }
-  if (!motor.enabled && s_wheelStill) phaseCurrentTrackZero(dt, false);
+  if (!motor.enabled && s_wheelStill) {
+    phaseCurrentTrackZero(dt, false);
+  }
+#if IPH_INLINE
+  else {
+    // Com o shunt EM SÉRIE não existe mais o instante de corrente-zero
+    // garantida (o TEZ), então o zero passa a sair da média longa girando —
+    // corrente de fase não tem componente contínua. Vale inclusive em roda
+    // livre com o motor desabilitado (fases em curto): a corrente que
+    // circula ali também é senoidal de média nula.
+    phaseCurrentTrackZeroSpin(dt, fabsf(velEst) * (float)MOTOR_POLE_PAIRS
+                                  * (1.0f / (2.0f * PI)));
+  }
+#endif
 #endif
 
   // ---- 1) Leituras (escalonadas p/ não pesar na fatia) -------------------
@@ -1107,6 +1122,7 @@ static void controlSlice(float dt) {
     phaseCurrentSarPowerAssert();
 #endif
     s_commLeadUs = prm(P_COMM_LEAD);   // cache p/ o SmoothingSensor (loop rápido)
+    s_measAgeUs  = prm(P_MEAS_AGE);    // idem, p/ a projeção dq
   }
 #endif
 #if NTC_SENSE_ENABLED
@@ -2387,8 +2403,15 @@ static void runAngleScan(float amps, float kmh) {
 
   float bestOff = 0.0f, bestI = 1e9f;
   bool  aborted = false;
-  for (int s = 0; s < 13 && !aborted; s++) {
-    const float offDeg = -36.0f + 6.0f * s;
+  // FAIXA ±60°, não ±36°: na bancada o mínimo caiu em +30° com +36° quase
+  // empatado, ou seja ENCOSTADO NA BORDA — o ótimo estava fora do que a
+  // varredura sabia olhar, e o resultado "aplicado" era só o melhor ponto
+  // visível, não o melhor ponto. Varredura que termina na borda não mediu
+  // nada; agora ela avisa quando isso acontece.
+  const int   ANG_N   = 21;
+  const float ANG_INI = -60.0f;
+  for (int s = 0; s < ANG_N && !aborted; s++) {
+    const float offDeg = ANG_INI + 6.0f * s;
     motor.zero_electric_angle = zeaBase + offDeg * 0.0174533f;
     const uint32_t t0us = micros();
     int   ms = 0, n = 0;
@@ -2436,10 +2459,29 @@ static void runAngleScan(float amps, float kmh) {
     return;
   }
   mcPrintf("[ang] minimo em %+.0f graus (%.2f A de bateria). ", bestOff, bestI);
+  if (bestOff <= ANG_INI + 3.0f || bestOff >= -ANG_INI - 3.0f)
+    mcPrintf("\n[ang] AVISO: o minimo caiu na BORDA da varredura — o otimo "
+             "esta FORA da faixa e este resultado NAO e o melhor ponto, e so "
+             "o melhor ponto visivel. Procure a causa no angulo zero (za) ou "
+             "no atraso de comutacao (cle), nao aplique como esta. ");
   if (fabsf(bestOff) >= 3.0f) {
-    paramSet(P_ZEA, zeaBase + bestOff * 0.0174533f);
+    // ÂNGULO ELÉTRICO É CIRCULAR: 6,81 rad e 0,52 rad são O MESMO ângulo.
+    // Sem normalizar aqui, o paramSet CORTA no limite superior (2π) e a
+    // correção morre em silêncio. Foi exatamente o que a bancada mostrou: a
+    // varredura achou +30°, tentou gravar 6,8068, saiu 6,2832 — o próprio
+    // valor de partida — e ainda imprimiu "APLICADO". A correção de 30° que
+    // valia 2,5x de corrente de bateria foi jogada fora sem um aviso.
+    const float TWO_PI_F = 6.28318531f;
+    float zeaNew = zeaBase + bestOff * 0.0174533f;
+    zeaNew = fmodf(zeaNew, TWO_PI_F);
+    if (zeaNew < 0.0f) zeaNew += TWO_PI_F;
+    paramSet(P_ZEA, zeaNew);
     paramsRequestSave();
     mcPrintf("APLICADO: P_ZEA = %.4f rad (salvo).\n", prm(P_ZEA));
+    // E confere que o valor SOBREVIVEU à gravação, em vez de confiar.
+    if (fabsf(prm(P_ZEA) - zeaNew) > 0.01f)
+      mcPrintf("[ang] ERRO: pedi %.4f rad e o parametro ficou %.4f — a "
+               "correcao NAO foi aplicada.\n", zeaNew, prm(P_ZEA));
   } else {
     mcPrintf("o angulo atual ja e o otimo — nada a mudar.\n");
   }
@@ -2543,7 +2585,7 @@ static const char *hFmt(char *b, float v, float piso) {
 // Foi isso que deixou um "40x acima do piso" variar 5x entre corridas.
 struct SwBin {
   int    n;
-  double sk, sq, sq2, sd, sd2, sm, sb, sv;
+  double sk, sq, sq2, sd, sd2, sm, sb, sv, su;   // su = Ud comandado
   double hc[4],  hs[4],  rc[4], rs[4];   // id  (3 harmonicas + sentinela)
   double hcq[4], hsq[4];                 // iq — TORQUE, o que se sente
 };
@@ -2594,16 +2636,37 @@ static int swReport(const char *tag, SwBin *set, float vlim, float alpha,
       qh[i][k] = ok ? rawQ[k] / gain[k] : -1.0f;
     }
     char f1[8], f2[8], f6[8], q1[8], q2[8], q6[8];
+    const float udM = (float)(g.su / g.n);
+    const float udL = prm(P_UD_MAX) * vlim;      // teto de autoridade do d
     mcPrintf("[var] %s | %5.1f km/h n=%-5d iq %5.2f id %5.2f |I| %4.2f "
-             "Ibat %4.2f Vq %4.1f (%.0f%%)\n", tag, km, g.n, iq, id,
-             (float)(g.sm / g.n), (float)(g.sb / g.n), (float)(g.sv / g.n),
-             100.0f * (float)(g.sv / g.n) / vlim);
+             "Ibat %4.2f Vq %4.1f (%.0f%%) Ud %+5.2f/%.1f%s\n", tag, km, g.n,
+             iq, id, (float)(g.sm / g.n), (float)(g.sb / g.n),
+             (float)(g.sv / g.n), 100.0f * (float)(g.sv / g.n) / vlim,
+             udM, udL, (fabsf(udM) > 0.9f * udL) ? " SATURADO!" : "");
     mcPrintf("[var]        id 1x %s 2x %s 6x %s | iq 1x %s 2x %s 6x %s "
              "[piso %.2f/%.2f]\n",
              hFmt(f1, bh[i][0], bp[i][0]), hFmt(f2, bh[i][1], bp[i][1]),
              hFmt(f6, bh[i][2], bp[i][2]), hFmt(q1, qh[i][0], qp[i][0]),
              hFmt(q2, qh[i][1], qp[i][1]), hFmt(q6, qh[i][2], qp[i][2]),
              bp[i][2], qp[i][2]);
+    // DESALINHAMENTO DO REFERENCIAL DE SAÍDA — só faz sentido em RODA LIVRE.
+    // Com corrente ~zero não há queda resistiva nem acoplamento cruzado
+    // (-w.Lq.iq), que são as duas únicas coisas que legitimamente pedem Ud.
+    // Sobra a componente de eixo d da FCEM: se o referencial em que a tensão
+    // é APLICADA estivesse alinhado, ela seria zero por definição. Logo
+    // Ud/Vq = tan(erro), e dividido por w_el vira o ATRASO em segundos —
+    // que é o que o P_COMM_LEAD existe para cancelar.
+    // Medir isto em DUAS velocidades separa as causas: atraso de tempo dá o
+    // mesmo tau e ângulos diferentes; erro de angulo zero (za) dá o mesmo
+    // ângulo e taus diferentes.
+    if (fabsf(iq) < 0.6f && (float)(g.sv / g.n) > 2.0f) {
+      const float wel = (km / radsToKmh(1.0f)) * (float)MOTOR_POLE_PAIRS;
+      const float ang = atanf(fabsf(udM) / (float)(g.sv / g.n));
+      mcPrintf("[var]        DESALINHAMENTO em roda livre: Ud/Vq %.3f -> "
+               "%.1f graus -> %.0f us de atraso (cancele com 'lead <us>')\n",
+               fabsf(udM) / (float)(g.sv / g.n), ang * 57.2958f,
+               wel > 1.0f ? ang / wel * 1e6f : 0.0f);
+    }
     if (best < 0 || bi1[i] > bi1[best]) best = i;
   }
   return best;
@@ -2659,7 +2722,7 @@ static void runSweep(float maxKmh, float ampMax) {
     // aqui daria o diagnóstico de um sistema que não existe.
     phaseCurrentRead(&s_iph, motor.electrical_angle -
                      motor.shaft_velocity * (float)MOTOR_POLE_PAIRS *
-                     ((s_commLeadUs + IPH_MEAS_AGE_US) * 1e-6f));
+                     ((s_commLeadUs + s_measAgeUs) * 1e-6f));
     const float vf = fabsf(radsToKmh(velFastRads()));
 
     // SOBE com corrente fixa, DESCE em roda livre. A descida é sem torque de
@@ -2707,6 +2770,10 @@ static void runSweep(float maxKmh, float ampMax) {
     g.sd += s_iph.id;   g.sd2 += (double)s_iph.id * s_iph.id;
     g.sm += s_iph.imag; g.sb  += ina226CurrentA();
     g.sv += motor.voltage.q;
+    // Ud COMANDADO. Sem ele não dá para distinguir "a malha de d está
+    // trabalhando e o id que sobra é irredutível" de "a malha de d bateu no
+    // teto de autoridade e desistiu" — os dois deixam id parado num valor.
+    g.su += s_udCmd;
 
     // --- demodulação síncrona ---------------------------------------------
     // Recorrência de ângulo duplo: 2 senos/cossenos por amostra em vez de 6.

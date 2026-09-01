@@ -98,6 +98,18 @@ enum : uint8_t {
                   //     no eixo d isso aparece como "id sobe sozinho com
                   //     picos". O proprio 'diag' imprime o veredito
                   //     (compara com o dp medido). Console 'db <A>'.
+  P_MEAS_AGE,     // [us] ATRASO TOTAL da medida de corrente em relacao ao
+                  //     angulo usado para projetar em dq. Nao e so a idade
+                  //     da amostra (~95 us pela taxa do ADC): soma tudo que
+                  //     atrasa o angulo — estimativa de velocidade do Hall,
+                  //     fatia de 1 kHz, filtro. Se estiver CURTO, o
+                  //     referencial de medicao fica girado de w.tau e
+                  //     aparece um id FANTASMA que CRESCE com a velocidade,
+                  //     que a malha de d entao tenta corrigir injetando
+                  //     corrente de verdade. Ajuste: varra ate o id medido
+                  //     ficar ~0 em TODA a faixa com FW desligado. Se um
+                  //     valor so nao serve para todas as velocidades, nao e
+                  //     atraso — procure outra causa. Console 'age <us>'.
   P__COUNT        // sentinela
 };
 #define PARAM_N (P__COUNT - 1)

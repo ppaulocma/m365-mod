@@ -70,6 +70,7 @@ static const ParamDef T[PARAM_N] = {
   { P_COMM_LEAD,  "cle", COMM_LEAD_US_DEFAULT,    0.0f, 500.0f },
   { P_UD_MAX,     "udx", UD_MAX_FRAC,             0.0f,   0.5f },
   { P_CUR_DB,     "cdb", CUR_DEADBAND_A,          0.0f,   3.0f },
+  { P_MEAS_AGE,   "age", IPH_MEAS_AGE_US,         0.0f, 1000.0f },
 };
 
 // Valores vivos, indexados por id (float alinhado => leitura atômica no Xtensa)
