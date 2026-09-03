@@ -519,6 +519,13 @@ static volatile uint8_t  capState = 0;    // 0 livre | 1 capturando | 2 pronto
 static float capAmpRads = 0, capBase = 0;
 static float fwIdA        = 0;   // [A] magnitude ATUAL do id de field weakening
 static float s_fwIdTarget = 0;   // [A] alvo entregue à malha de d (= −fwIdA)
+// [A] piso de acusação da guarda de "sensor invertido". Fica AQUI, calculado
+// onde a matemática do FW já mora, porque fazer esta conta DENTRO da guarda
+// degradava a malha de forma reprodutível — inclusive gravando em variável
+// morta que ninguém lia, o que descarta a lógica e aponta para efeito de
+// compilação naquela função (alocação de registrador / inlining). A linha da
+// guarda volta a ser o que sempre foi: uma comparação contra um valor.
+static float s_invThrA    = 1.5f;
 
 // --- MTPA por BUSCA (mínimo de corrente) -------------------------------------
 // SPM (Ld~Lq): MTPA = id 0 = comutação exatamente 90° à frente do fluxo.
@@ -1220,7 +1227,7 @@ static void controlSlice(float dt) {
     // acusava inversão em operação sã. Sensor invertido DE VERDADE dá média
     // sustentada do lado errado — cai aqui em ~100-200 ms do mesmo jeito.
     fbIqEma += 0.01f * (s_iph.iq - fbIqEma);
-    bool inverted  = (s_iqTarget * fbIqEma) < 0 && fabsf(fbIqEma) > 1.5f;
+    bool inverted  = (s_iqTarget * fbIqEma) < 0 && fabsf(fbIqEma) > s_invThrA;
     // "SEM RESPOSTA" só acusa quando HÁ folga de tensão para responder: no
     // topo de velocidade (BEMF ≈ teto) o iq fisicamente NÃO alcança o alvo —
     // Vq saturado com iq pequeno ali é operação legítima, não sensor morto
@@ -1452,17 +1459,37 @@ static void controlSlice(float dt) {
   // brigando contra. Agora o FW escreve um ALVO NEGATIVO de id direto na
   // malha de d (que existe e tem prioridade de orçamento): id preciso,
   // independente do torque, MEDIDO (entra em |I| e nos trips) e desfeito
-  // pela própria malha ao aliviar. O joelho é % de UTILIZAÇÃO DO TETO REAL
-  // (|U|/teto vivo) — imune a mudança de teto de amostragem e a estado da
-  // bateria (o antigo comparava com % de duty absoluto: quando o teto de
-  // operação virou 78%, o joelho de 92% ficou inalcançável e o FW morreu).
+  // pela própria malha ao aliviar. O joelho é % de UTILIZAÇÃO DO TETO VIVO,
+  // não % de duty absoluto: teto absoluto muda com a bateria e com a
+  // topologia, e um joelho fixo contra ele fica inalcançável sozinho.
+  //
+  // COM SHUNT EM SÉRIE (IPH_INLINE) o FW muda de papel, para melhor:
+  //   - o teto que resta é o BOOTSTRAP do driver (P_MODCEIL), que é limite de
+  //     hardware. Antes o teto era a janela de amostragem, e contra ela o FW
+  //     não podia nada — reduzir fluxo não devolve janela. Contra o bootstrap
+  //     ele funciona: menos fluxo = menos FCEM = mais velocidade sob o MESMO
+  //     duty. É a única forma de passar daqui sem trocar o estágio.
+  //   - e agora existe medida de id CONFIÁVEL no duty em que o FW opera. No
+  //     low-side as amostras eram rejeitadas justamente perto do teto, então
+  //     a malha de d fechava sobre lixo exatamente onde o FW vivia. Fechar um
+  //     laço de corrente sobre medida inválida não é FW, é ruído com nome.
   // Só no TURBO; nunca em regen; colapsa ao soltar o punho.
   {
     const float fwMaxA = fwAllowed ? prm(P_FW_MAX_A) : 0.0f;
     if (fwMaxA > 0.05f && velEst > 1.0f && cmd.brake < 0.02f
         && cmd.throttle > 0.05f && fsEffVLim > 1.0f) {
-      const float util = 100.0f * hypotf(motor.voltage.q, motor.voltage.d)
-                       / fsEffVLim;               // % do teto de tensão em uso
+      // UTILIZAÇÃO MEDIDA SÓ NO EIXO Q — e isso é o conserto, não um detalhe.
+      // Com |U| = hypot(uq, ud) o FW se auto-alimentava: o próprio ud que a
+      // malha de d gasta para injetar o id do FW entrava na conta, empurrava
+      // a utilização para cima do joelho e pedia MAIS FW. Realimentação
+      // POSITIVA — o FW disparava até o teto sozinho e ficava lá.
+      // Com uq no numerador o laço inverte de sinal e passa a fechar: mais FW
+      // -> menos fluxo -> menos FCEM -> menos uq necessário -> a utilização
+      // CAI -> o integrador para. O ponto de equilíbrio é exatamente
+      // util = joelho, que é o que se quer de um regulador integral.
+      // O erro de usar vLimit (e não uqMax) no denominador é de 2% com 5 V de
+      // ud, e erra para o lado conservador.
+      const float util = 100.0f * fabsf(motor.voltage.q) / fsEffVLim;
       const float err  = util - prm(P_FW_START);  // >0 = saturando
       // sobe ~10 A em ~1,5 s de saturação plena (err≈8%); alivia 2x mais
       // rápido quando a utilização volta para baixo do joelho
@@ -1712,7 +1739,19 @@ static void controlSlice(float dt) {
   //   - scale = foldback de corrente de BATERIA x derate térmico x derate de
   //     tensão. Reduzir CORRENTE é o certo: reduzir tensão como antes mexia
   //     no torque por um caminho indireto e dependente da velocidade.
-  float iqMax = fminf(prm(P_IQ_MAX), (float)IQ_MAX_ABS_A) * scale;
+  // ORÇAMENTO DE CORRENTE DE FASE. O TRIP é o limite FÍSICO: pedir mais do
+  // que ele permite é garantir o corte, não é "andar mais forte". O teto de
+  // torque do piloto (P_IQ_MAX) e o id do FW dividem ESTE orçamento, e nenhum
+  // dos dois passa por cima dele.
+  // Sem este teto o alvo rampava por cima do trip e a malha entregava
+  // obedientemente até cortar — caixa-preta de 02/set: alvo subindo até
+  // 35,8 A contra trip de 30 A, iq MEDIDO seguindo colado o tempo todo (a
+  // malha estava perfeita), e sobrecorrente no fim. Um limite que só existe
+  // para ser violado não é limite.
+  const float iBudget = fminf((float)IQ_MAX_ABS_A,
+                              prm(P_IPH_TRIP) * I_BUDGET_FRAC) * scale;
+  float iqMax = fminf(fminf(prm(P_IQ_MAX), (float)IQ_MAX_ABS_A) * scale,
+                      iBudget);
 
   // ---- ORÇAMENTO DE CORRENTE COMPARTILHADO COM O FIELD WEAKENING ---------
   // O id do FW é corrente REAL: entra em |I|, no trip de fase e no calor
@@ -1725,10 +1764,32 @@ static void controlSlice(float dt) {
   // E o FW sofre os MESMOS derates do torque (scale = foldback de bateria x
   // térmico x tensão). Antes ele ficava injetando id em cima de um motor já
   // em derate térmico — despejando calor exatamente onde se pedia menos.
-  const float fwId = fwIdA * scale;
+  //
+  // O orçamento é o LIMITE FÍSICO (trip de fase), NÃO o teto de torque que o
+  // piloto escolheu. Descontar do teto do piloto era uma realimentação que se
+  // mordia: mais FW -> menos iq -> menos empuxo -> a patinete desacelera ->
+  // a utilização cai abaixo do joelho -> o FW colapsa -> a velocidade volta
+  // -> o FW sobe de novo. Com P_IQ_MAX=10 A e 8 A de FW o corte era de 40% do
+  // torque (√(100−64) = 6 A), grande o bastante para o ciclo ser sentido como
+  // solavanco em vez de ganho de velocidade.
+  // Contra o trip a conta muda de natureza: 30 A de trip, 10 A de iq e 8 A de
+  // FW dão |I| = 12,8 A — folgado, e o iq não é tocado. O FW só passa a
+  // cobrar torque quando hypot(iq, id) encosta MESMO no limite físico, que é
+  // quando cobrar está certo.
+  // O FW sozinho também não pode estourar o orçamento: sem este teto, um
+  // P_FW_MAX_A alto configurado no app levaria |I| ao trip com o punho solto.
+  const float fwId = fminf(fwIdA * scale, iBudget * 0.8f);
   s_fwIdTarget = -fwId;                       // alvo entregue à malha de d
+  // Piso de acusação da guarda de inversão, proporcional ao id injetado.
+  // Com id COMANDADO grande o iq medido deixa de ser um número próprio e vira
+  // a diferença de dois grandes: iq_ap = iq*cos(d) - id*sen(d). Com 15 A de
+  // id, 5° de resíduo de referencial já jogam 1,3 A no iq e VIRAM O SINAL
+  // dele — foi o 0x08 falso a 41 km/h, iq médio -1,3 A com alvo +20,4 A.
+  // Inversão de verdade não dá 1-2 A: dá corrente do tamanho do alvo com o
+  // sinal trocado. 0.42 = 3*sen(8°); o resíduo medido é ~1°.
+  s_invThrA = (fwId > 0.5f) ? fmaxf(1.5f, fwId * 0.42f) : 1.5f;
   if (fwId > 0.05f)
-    iqMax = sqrtf(fmaxf(iqMax * iqMax - fwId * fwId, 0.0f));
+    iqMax = fminf(iqMax, sqrtf(fmaxf(iBudget * iBudget - fwId * fwId, 0.0f)));
   // Walk e trava eletrônica são limites de FASE por natureza: acontecem a ~0
   // km/h, onde a corrente de bateria é quase nula e só a de fase existe.
   // Aplicá-los aqui é mais correto do que no foldback de bateria (onde

@@ -269,7 +269,11 @@
 // PROTEÇÃO POR MAGNITUDE |I| = sqrt(ialpha² + ibeta²). É a grandeza certa para
 // proteger: não depende do ângulo elétrico, então o Hall grosso (±30° parado)
 // não a contamina. Substitui o antigo teto de tensão sobre a back-EMF.
-#define IPH_TRIP_A              30.0f  // [A] trip duro de pico de fase (suba
+// 60 A e PICO de fase, nao continuo: com resistencia de ramo medida ~0,12 Ohm,
+// 60 A dissipam ~430 W de cobre no motor — muito acima dos 250 W nominais. Quem
+// segura o abuso sustentado e o derate termico do motor (MOTOR_TEMP_DERATE_C),
+// nao este numero. 90 A era otimista demais para este motor.
+#define IPH_TRIP_A              60.0f  // [A] trip duro de pico de fase (suba
                                        // junto com IQ_MAX, sempre acima dele)
 #define IPH_TRIP_MS             40     // [ms] acima do trip p/ travar falta
 #define IPH_TRIP_HARD_MULT      1.6f   // x IPH_TRIP_A = corte INSTANTÂNEO
@@ -422,7 +426,7 @@
 #define IPH_PRETRIG_ENABLE      1
 // Guarda somada à latência média medida no boot para posicionar o disparo:
 // PRETRIG = lat_avg + guarda ⇒ S&H nominal ~[−0,7..+1,3 µs] do TEP.
-#define IPH_PRETRIG_GUARD_US    1.0f
+#define IPH_PRETRIG_GUARD_US    2.5f
 // Entre o start do SAR e o início efetivo do S&H (setup do controlador).
 #define IPH_SAR_SETUP_US        0.3f
 // CERCO DE SANIDADE do zero vivo [V], em torno do zero da calibração. Não é
@@ -473,7 +477,16 @@
 // é o primeiro que se sobe depois de conferir no Monitor que Iq medido segue
 // Iq pedido. Comece baixo, ande, confira, suba. 10 A já movem o patinete.
 #define IQ_MAX_DEFAULT_A        10.0f  // [A] default (ajustável no app)
-#define IQ_MAX_ABS_A            40.0f  // [A] teto absoluto que o app permite
+// [A] teto ABSOLUTO que o app permite pedir de corrente de fase. Com 6x
+// IRFP4110 (100 V, 3,7 mOhm, 180 A de pacote) o estagio de potencia nao e
+// mais o limite — quem limita e o MOTOR (250 W nominal) e o pack. Este teto
+// existe para o app nao oferecer um numero que o resto do sistema nao
+// sustenta; o orcamento real sai de P_IPH_TRIP * I_BUDGET_FRAC.
+#define IQ_MAX_ABS_A            70.0f
+// Fração do TRIP de fase que serve de orçamento para TODA a corrente pedida —
+// o iq do punho e o id do field weakening somados vetorialmente. Não é 1.0
+// porque |I| medido tem ondulação: viver no trip é tripar.
+#define I_BUDGET_FRAC           0.85f
 
 // PI da malha de corrente (saída em volts, entra em Uq/Ud).
 //   P = L * ωc      I = R * ωc      com ωc = 2π * banda desejada
@@ -692,14 +705,14 @@
 // É o ÚNICO teto de tração: default médio (14 A), teto que o app permite pedir
 // (20 A). Sem teto de potência oculto — quem manda é a "Corrente máxima" do app.
 #define I_LIMIT_DEFAULT_A       14.0f    // [A] limite de corrente de bateria (médio)
-#define I_LIMIT_MAX_A           20.0f    // [A] teto que a dashboard permite pedir
+#define I_LIMIT_MAX_A           40.0f    // [A] teto que a dashboard permite pedir
 
 #define REGEN_I_LIMIT_A         6.0f     // [A] corrente máx. de REGENERAÇÃO (freio)
                                          //     conservador (regen num pack cheio
                                          //     eleva a tensão do barramento)
 
 // Proteção de SOBRECORRENTE dura (desliga e trava até "limpar faltas")
-#define OC_TRIP_A               26.0f    // [A] trip duro de bateria: acima do limite
+#define OC_TRIP_A               60.0f    // [A] trip duro de bateria: acima do limite
                                          // (20) com margem. Backstop de BATERIA
                                          // (não vê corrente de fase — ver VOVER)
 #define OC_TRIP_MS              100      // [ms] tempo acima do limiar p/ disparar
