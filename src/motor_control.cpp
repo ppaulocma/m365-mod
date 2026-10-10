@@ -609,6 +609,71 @@ static float slewLimit(float current, float target, float rateUp, float rateDown
   return target;
 }
 
+// ---------------------------------------------------------------------------
+// DESENROLAR A REFERÊNCIA QUANDO O PILOTO REDUZ O PEDIDO
+// ---------------------------------------------------------------------------
+// Com o acionamento SATURADO (tensão no teto, a 37 km/h) a corrente não
+// alcança o alvo, e o alvo sobe até iqMax mesmo assim: 45 A pedidos, 10 A
+// entregues. Ao soltar o punho ele desce a P_SLEW_REL, e os primeiros 35 A de
+// descida NÃO FAZEM NADA — a corrente real já estava abaixo. Isso é o atraso
+// de desaceleração. No modo velocidade é muito pior: o alvo vai a vmax (50
+// km/h) com a roda em 37, e desce a P_DECEL (8 rad/s²) — 4,2 SEGUNDOS
+// tracionando depois de soltar.
+//
+// A correção NÃO é um teto contínuo "alvo ≤ medido + folga". Isso foi tentado
+// e quebrou: usar o medido como teto do comandado fecha malha, e o ruído do
+// medido vira ratchet para baixo. Aqui é um SALTO, e só quando três coisas
+// valem ao mesmo tempo:
+//   1) o pedido está DIMINUINDO (pedido < alvo) — subida nunca é tocada;
+//   2) o alvo está mais de uma folga ACIMA do real — que é a própria definição
+//      de saturação: sem saturar, a malha acompanha e a diferença é ruído;
+//   3) o alvo nunca vai para baixo do PEDIDO — só some o trecho morto.
+// Daí em diante a rampa normal continua de onde a realidade está.
+static inline void unwindIqTarget(float desired) {
+  if (!s_iphOk || !motor.enabled) return;
+  if (s_iqTarget > 0.0f && desired < s_iqTarget) {
+    const float real = fmaxf(s_iph.iq, 0.0f) + IQ_UNWIND_MARGIN_A;
+    if (s_iqTarget > real) s_iqTarget = fmaxf(desired, real);
+  } else if (s_iqTarget < 0.0f && desired > s_iqTarget) {   // freio, simétrico
+    const float real = fminf(s_iph.iq, 0.0f) - IQ_UNWIND_MARGIN_A;
+    if (s_iqTarget < real) s_iqTarget = fminf(desired, real);
+  }
+}
+
+// Modo velocidade: mesmo salto no alvo de VELOCIDADE, e o integrador do
+// PID_velocity é semeado com a corrente real — sem isso ele continua cravado
+// no limite e o salto do alvo não muda nada na saída.
+// Exige o acionamento SATURADO (alvo de corrente acima do medido). Sem essa
+// condição, numa subida em que a roda desacelera mais rápido que P_DECEL o
+// salto se repetiria a cada fatia e mudaria a semântica do modo; com ela, só
+// o windup de saturação é desfeito e o resto continua seguindo a rampa.
+static inline void unwindVelTarget(float desiredVel) {
+  if (!s_iphOk || !motor.enabled) return;
+  // SUBIDA com o alvo ABAIXO da roda: acontece depois de frear, ou da rampa
+  // P_DECEL, quando a roda ficou acima do alvo (motor sem poder frear o
+  // bastante, ou bateria cheia sem regen). Se o piloto acelera de novo, o alvo
+  // teria de subir de lá até passar a roda, e nesse trecho o PID continua
+  // FREANDO com o punho pressionado. Salta para a roda, sem passar do pedido,
+  // e o integrador sai da frenagem.
+  if (desiredVel > velTarget) {
+    const float v = fmaxf(velEst, 0.0f);
+    if (velTarget < v - VEL_UNWIND_MARGIN_RADS) {
+      velTarget = fminf(desiredVel, v);
+      static_cast<PIDSeed&>(motor.PID_velocity).seedOutput(
+          fminf(fmaxf(s_iph.iq, 0.0f), motor.PID_velocity.limit));
+    }
+    return;
+  }
+  if (velTarget <= 0.0f) return;
+  const float real = fmaxf(velEst, 0.0f) + VEL_UNWIND_MARGIN_RADS;
+  if (velTarget <= real) return;
+  if (s_iqTarget <= fmaxf(s_iph.iq, 0.0f) + IQ_UNWIND_MARGIN_A) return;
+  velTarget = fmaxf(desiredVel, real);
+  static_cast<PIDSeed&>(motor.PID_velocity).seedOutput(
+      fminf(fmaxf(s_iph.iq, 0.0f) + IQ_UNWIND_MARGIN_A,
+            motor.PID_velocity.limit));
+}
+
 // Corrente (INA226), tensão e NTC vêm da task de sensores no núcleo 0
 // (ina226CurrentA/sensVbatV/sensTempC): analogRead/I2C têm seção crítica
 // interna e no núcleo 1 atrasavam as ISRs dos Halls (skips em baixa rotação).
@@ -1434,9 +1499,20 @@ static void controlSlice(float dt) {
   // camada dura por cima da curva gradual (bateria cheia não aceita carga)
   if (vBatFilt >= prm(P_BATT_VMAX)) regenVAllow = 0.0f;
 #endif
-  float brkEff = curveEval(CRV_BRAKE, cmd.brake * 100.0f) * 0.01f
-               * curveEval(CRV_REGEN_S, fabsf(radsToKmh(velEst))) * 0.01f
-               * regenVAllow;
+  // INTENÇÃO de frear (manete) separada da PERMISSÃO de regenerar (bateria).
+  // Antes as duas vinham multiplicadas num número só, e isso gerava dois
+  // defeitos:
+  //  - com a bateria cheia regenVAllow vira 0, brkEff vira 0, e o ramo do
+  //    freio NÃO ERA NEM ENTRADO: o manete apertado caía no ramo do
+  //    acelerador e, com o punho também pressionado, o motor seguia
+  //    TRACIONANDO. Manete tem de cortar tração sempre — poder ou não
+  //    regenerar só muda quanto o motor ajuda a frear.
+  //  - regenVAllow era aplicado DUAS vezes (aqui e no teto do ramo do freio):
+  //    com a bateria a meio caminho do corte o freio caía para 25% em vez de
+  //    50%, e a força de frenagem mudava com a carga de um jeito quadrático.
+  const float brkLever = curveEval(CRV_BRAKE, cmd.brake * 100.0f) * 0.01f;
+  float brkEff = brkLever
+               * curveEval(CRV_REGEN_S, fabsf(radsToKmh(velEst))) * 0.01f;
   fsThrEff = thrEff; fsBrkEff = brkEff;              // p/ data-log profundo
 
 #if !OPEN_LOOP_TEST
@@ -1473,11 +1549,25 @@ static void controlSlice(float dt) {
   //     low-side as amostras eram rejeitadas justamente perto do teto, então
   //     a malha de d fechava sobre lixo exatamente onde o FW vivia. Fechar um
   //     laço de corrente sobre medida inválida não é FW, é ruído com nome.
-  // Só no TURBO; nunca em regen; colapsa ao soltar o punho.
+  // CONSTRÓI só no TURBO, com acelerador e sem freio. Sem pedido, SEGURA ou
+  // DESCE conforme a utilização — não colapsa mais ao soltar (ver fwBuild).
   {
-    const float fwMaxA = fwAllowed ? prm(P_FW_MAX_A) : 0.0f;
-    if (fwMaxA > 0.05f && velEst > 1.0f && cmd.brake < 0.02f
-        && cmd.throttle > 0.05f && fsEffVLim > 1.0f) {
+    // CONSTRUIR FW exige o piloto pedindo (TURBO, acelerador, sem freio).
+    // SEGURAR não. Antes, soltar o punho ou frear colapsava o FW a 20 A/s em
+    // QUALQUER velocidade — e acima da velocidade de base o FW é justamente o
+    // que mantém a FCEM abaixo da tensão. Tirado de uma vez, a FCEM passa da
+    // tensão, a ponte RETIFICA e despeja corrente no barramento: com bateria
+    // vira um tranco de freio ao soltar, com fonte de bancada vira
+    // sobretensão (é o mecanismo do buck de 12 V queimado em 02/out). E ao
+    // encostar 10% no meio do colapso o FW reconstruía do zero: subia, passava
+    // do ponto, caía — o "encosto e ele sobe e depois cai".
+    // Agora, sem pedido, o integrador só pode SEGURAR ou DESCER: segue a
+    // utilização enquanto ela está acima do joelho e solta conforme a
+    // velocidade cai. Nunca cresce sem o piloto pedir.
+    const float fwMaxA  = fwAllowed ? prm(P_FW_MAX_A) : 0.0f;
+    const bool  fwBuild = fwMaxA > 0.05f && brkLever < 0.01f   // mesmo limiar do ramo do freio
+                          && cmd.throttle > 0.05f;
+    if (velEst > 1.0f && fsEffVLim > 1.0f && (fwBuild || fwIdA > 0.0f)) {
       // UTILIZAÇÃO MEDIDA SÓ NO EIXO Q — e isso é o conserto, não um detalhe.
       // Com |U| = hypot(uq, ud) o FW se auto-alimentava: o próprio ud que a
       // malha de d gasta para injetar o id do FW entrava na conta, empurrava
@@ -1490,11 +1580,25 @@ static void controlSlice(float dt) {
       // O erro de usar vLimit (e não uqMax) no denominador é de 2% com 5 V de
       // ud, e erra para o lado conservador.
       const float util = 100.0f * fabsf(motor.voltage.q) / fsEffVLim;
-      const float err  = util - prm(P_FW_START);  // >0 = saturando
+      float err = util - prm(P_FW_START);         // >0 = saturando
+      // TETO DE CONSTRUÇÃO PROPORCIONAL AO ACELERADOR. Antes bastava passar de
+      // 5% para o FW poder crescer até P_FW_MAX_A inteiro: encostar no punho
+      // durante a saída do FW o fazia subir de novo, e no curso intermediário
+      // o acelerador não tinha efeito nenhum na velocidade de topo (qualquer
+      // posição pedia mais corrente do que a tensão deixa passar).
+      // Agora o piloto autoriza uma FATIA do FW: punho cheio = tudo (topo
+      // igual ao de antes), metade = metade, encostado = nada. Só limita
+      // CONSTRUIR: acima da fatia o integrador segura ou desce pela
+      // utilização, nunca é arrancado — arrancar o FW acima da velocidade de
+      // base faz a ponte retificar para o barramento.
+      const float thrUse = fmaxf((thrEff - THR_COAST_FRAC)
+                                 / (1.0f - THR_COAST_FRAC), 0.0f);
+      if (!fwBuild || fwIdA >= prm(P_FW_MAX_A) * thrUse)
+        err = fminf(err, 0.0f);                     // sem autorização: segura/desce
       // sobe ~10 A em ~1,5 s de saturação plena (err≈8%); alivia 2x mais
       // rápido quando a utilização volta para baixo do joelho
-      fwIdA += err * (err > 0 ? 0.8f : 1.6f) * dt;
-      fwIdA  = constrain(fwIdA, 0.0f, fwMaxA);
+      fwIdA += err * (err > 0 ? FW_KI_UP : FW_KI_DOWN) * dt;
+      fwIdA  = constrain(fwIdA, 0.0f, prm(P_FW_MAX_A));
     } else {
       fwIdA = fmaxf(0.0f, fwIdA - 20.0f * dt);    // colapso rápido
     }
@@ -1559,7 +1663,7 @@ static void controlSlice(float dt) {
 #if PHASE_CUR_ENABLED
     bool driving = motor.enabled && s_iphOk
                    && s_iphMagFilt > STALL_IQ_MIN_A
-                   && brkEff < 0.02f && ovr != 1;
+                   && brkLever < 0.02f && ovr != 1;
     // "Parado" exige velEst baixo E silêncio de bordas de Hall (s_wheelStill,
     // 300 ms sem borda). Só o velEst não serve: quando o ruído denso come
     // bordas reais, o ângulo congela e o velEst desaba COM A RODA GIRANDO —
@@ -1788,6 +1892,20 @@ static void controlSlice(float dt) {
   // Inversão de verdade não dá 1-2 A: dá corrente do tamanho do alvo com o
   // sinal trocado. 0.42 = 3*sen(8°); o resíduo medido é ~1°.
   s_invThrA = (fwId > 0.5f) ? fmaxf(1.5f, fwId * 0.42f) : 1.5f;
+  // FCEM ACIMA DO TETO DE TENSAO = o motor GERA, e o iq fica NEGATIVO por
+  // fisica, com qualquer alvo. Acontece em descida ou com a roda empurrada
+  // acima da velocidade que a tensao disponivel sustenta: a diferenca entre
+  // FCEM e tensao aplicada forca corrente de volta pela impedancia, e nenhum
+  // comando muda isso.
+  // O ramo "sem resposta" ja sabia disso (bemfFrac < 0,70); o de "sinal
+  // invertido" nao sabia, e acusava a realidade. Caixa-preta de 02/out:
+  // 37,8 km/h, FCEM 30,8 V contra teto de 23,1 V (bemfFrac 1,34), Vq e Vd
+  // ambos CRAVADOS no teto, alvo +9 A e medido -1,8 A — operacao legitima
+  // num regime insustentavel, nao sensor trocado.
+  // Desarmado por teto alto em vez de condicao extra na guarda: a linha do
+  // 'inverted' continua sendo uma comparacao contra um valor, que e a forma
+  // que nao degrada a malha (ver o bloco do IRAM em iram_hot.ld).
+  if (prm(P_KE) * fabsf(velEst) > 0.95f * effVLimit) s_invThrA = 1.0e6f;
   if (fwId > 0.05f)
     iqMax = fminf(iqMax, sqrtf(fmaxf(iBudget * iBudget - fwId * fwId, 0.0f)));
   // Walk e trava eletrônica são limites de FASE por natureza: acontecem a ~0
@@ -1853,7 +1971,7 @@ static void controlSlice(float dt) {
     // O alvo é CORRENTE (Iq em ampères). Tudo abaixo calcula ampères; o
     // SimpleFOC fecha a malha contra os INA240 e decide a tensão sozinho.
     float desired;
-    if (brkEff > 0.01f) {
+    if (brkLever > 0.01f) {
       coastActive = false;
       ecoState = 0; ecoSteadyMs = 0;               // freio cancela o eco
       // FREIO = corrente NEGATIVA (regen). Antes era "tensão contrária ao
@@ -1864,9 +1982,14 @@ static void controlSlice(float dt) {
       desired = (fabsf(velEst) > BRAKE_MIN_SPEED_RADS)
                   ? -sgnf(velEst) * brkEff * regenIqMax
                   : 0.0f;
+      unwindIqTarget(desired);
+      // SEM rideSlew: o multiplicador de modo amacia a ACELERAÇÃO do ECO
+      // (0,55) e do NORMAL (0,85), e estava amaciando o FREIO junto — no ECO
+      // a frenagem levava quase o dobro do tempo para se formar. Resposta de
+      // freio não pode depender do modo de pilotagem.
       s_iqTarget = slewLimit(s_iqTarget, desired,
-                             prm(P_SLEW_UP) * rideSlew, prm(P_SLEW_REL), dt);
-    } else if (prm(P_COAST) > 0.5f && thrEff < 0.06f && s_spinReqA < 0.0f
+                             prm(P_SLEW_UP), prm(P_SLEW_REL), dt);
+    } else if (prm(P_COAST) > 0.5f && thrEff < THR_COAST_FRAC && s_spinReqA < 0.0f
                && fabsf(velEst) > kmhToRads(2.0f)) {
       // (o teste 'gira' pede acelerador zero de propósito — sem esta guarda a
       //  costeira assumiria e o alvo do teste nunca chegaria à malha)
@@ -1876,6 +1999,7 @@ static void controlSlice(float dt) {
       // a velocidade estiver SUBINDO com alvo ~0, o integrador sangra até
       // parar de subir. Rastrear BEMF na descida segue livre.
       coastActive = true;
+      unwindIqTarget(COAST_TARGET_A);
       s_iqTarget = slewLimit(s_iqTarget, COAST_TARGET_A,
                              prm(P_SLEW_UP), prm(P_SLEW_REL), dt);
       // (a guarda "alvo zero não acelera" virou LEI GLOBAL do modo torque —
@@ -1883,14 +2007,17 @@ static void controlSlice(float dt) {
       //  outro caminho que produza alvo ~0 em velocidade.)
     } else {
       coastActive = false;
-      desired = thrEff * iqMax;
+      // Faixa útil do acelerador reescalonada (ver THR_COAST_FRAC): o alvo
+      // nasce em ZERO no limiar da costeira, em vez de pular para 2,7 A.
+      desired = fmaxf((thrEff - THR_COAST_FRAC) / (1.0f - THR_COAST_FRAC),
+                      0.0f) * iqMax;
       // PUNHO SOLTO (coast desligado) = FREIO-MOTOR LEVE, nunca alvo zero.
       // A caixa-preta provou que "iq=0 em velocidade" se auto-acelera (torque
       // da pulsação de setor invisível ao iq medido — ver RELEASE_BRAKE_A no
       // config). Alvo levemente NEGATIVO é estável por construção e reproduz
       // o comportamento do firmware antigo que era comprovadamente bom.
-      if (thrEff < 0.06f && fabsf(velEst) > kmhToRads(RELEASE_BRAKE_MIN_KMH))
-        desired = -sgnf(velEst) * RELEASE_BRAKE_A;
+      if (thrEff < THR_COAST_FRAC && fabsf(velEst) > kmhToRads(RELEASE_BRAKE_MIN_KMH))
+        desired = -sgnf(velEst) * RELEASE_BRAKE_A * regenVAllow;   // bateria cheia: sem regen
       if (s_spinReqA >= 0.0f) desired = fminf(s_spinReqA, iqMax);   // teste 'spin'
       s_iqDemand = fabsf(desired);         // o que o piloto pede, ANTES do teto
 
@@ -1952,6 +2079,7 @@ static void controlSlice(float dt) {
       // porque em modo tensão baixar o alvo abaixo da back-EMF vira frenagem
       // regenerativa forte. Com malha de corrente, pedir 2 A é 2 A: não há
       // freio escondido, então não há piso a defender.
+      unwindIqTarget(desired);
       s_iqTarget = slewLimit(s_iqTarget, desired,
                              prm(P_SLEW_UP) * rideSlew, prm(P_SLEW_REL), dt);
     }
@@ -2027,12 +2155,14 @@ static void controlSlice(float dt) {
         capIdx = capIdx + 1;
       }
       if (capIdx >= CAP_N) { capState = 2; velTarget = capBase; }
-    } else if (brkEff > 0.01f) {
+    } else if (brkLever > 0.01f) {
       float decel = brkEff * prm(P_BRAKE_DEC);
+      unwindVelTarget(0.0f);
       if (velTarget > 0) velTarget = fmaxf(0.0f, velTarget - decel * dt);
       else               velTarget = fminf(0.0f, velTarget + decel * dt);
     } else {
       float desired = thrEff * vmax;
+      unwindVelTarget(desired);
       velTarget = slewLimit(velTarget, desired, prm(P_ACCEL) * rideSlew,
                             prm(P_DECEL), dt);
     }
@@ -2054,6 +2184,22 @@ static void controlSlice(float dt) {
       appliedTarget = 0.0f;
     } else {
       s_iqTarget = motor.PID_velocity(velTarget - velEst);
+      // REGEN DO MODO VELOCIDADE com o MESMO teto do freio do modo torque.
+      // O limite do PID é simétrico (±iqMax), então freando ou seguindo a
+      // rampa P_DECEL ele podia pedir até −45 A de regeneração — ignorando o
+      // P_REGEN_I e, pior, a bateria cheia (regenVAllow). Com o pack em
+      // 42,5 V isso empurrava corrente para dentro de uma bateria que não
+      // aceita, e com fonte de bancada, para dentro da fonte.
+      // Ao cortar, o integrador é semeado no próprio teto: sem isso ele
+      // seguiria acumulando para baixo, e ao soltar o freio a tração
+      // demoraria a voltar.
+      {
+        const float rgLim = fminf(prm(P_REGEN_I) * regenVAllow, iqMax);
+        if (s_iqTarget < -rgLim) {
+          s_iqTarget = -rgLim;
+          static_cast<PIDSeed&>(motor.PID_velocity).seedOutput(-rgLim);
+        }
+      }
       appliedTarget = runCurrentLoops(s_iqTarget, dt, effVLimit);
     }
   }

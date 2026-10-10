@@ -269,14 +269,39 @@
 // PROTEÇÃO POR MAGNITUDE |I| = sqrt(ialpha² + ibeta²). É a grandeza certa para
 // proteger: não depende do ângulo elétrico, então o Hall grosso (±30° parado)
 // não a contamina. Substitui o antigo teto de tensão sobre a back-EMF.
-// 60 A e PICO de fase, nao continuo: com resistencia de ramo medida ~0,12 Ohm,
-// 60 A dissipam ~430 W de cobre no motor — muito acima dos 250 W nominais. Quem
-// segura o abuso sustentado e o derate termico do motor (MOTOR_TEMP_DERATE_C),
-// nao este numero. 90 A era otimista demais para este motor.
-#define IPH_TRIP_A              60.0f  // [A] trip duro de pico de fase (suba
+// TETO FISICO DA MEDICAO, nao escolha livre. Com shunt de 1 mOhm e INA240A1
+// (ganho 20) o fundo de escala medido e +-64,6 A, e o que manda e o CORTE
+// INSTANTANEO, que age em trip x IPH_TRIP_HARD_MULT (1,25):
+//     64,6 / 1,25 = 51,7 A de trip maximo
+// 50 A deixa 3% de folga nisso, para variacao do zero entre boots nao
+// reprovar a calibracao. Para passar daqui o caminho e shunt de 0,5 mOhm
+// (fundo de escala ~129 A, metade da resolucao).
+// Acima daqui a propria calibracao REPROVA e bloqueia a malha de corrente —
+// com razao: passado o fundo de escala a leitura MENTE PARA BAIXO, e uma malha
+// de corrente que ve pouca corrente empurra MAIS tensao. E o pior modo de
+// falha que existe aqui.
+// 48 A tambem e PICO, nao continuo: com resistencia de ramo ~0,12 Ohm isso da
+// ~280 W de cobre dentro de um motor de 250 W nominais. Quem segura o abuso
+// sustentado e o derate termico do motor (MOTOR_TEMP_DERATE_C), nao este
+// numero — e 48 A de pico ja sao quase 5x a corrente nominal dele.
+// Para subir daqui o caminho e HARDWARE: shunt de 0,5 mOhm devolve fundo de
+// escala de ~129 A (trip ate ~99 A) ao custo de metade da resolucao. Nao ha
+// INA240 com ganho menor que 20, entao por ganho nao se resolve.
+#define IPH_TRIP_A              50.0f  // [A] trip duro de pico de fase (suba
                                        // junto com IQ_MAX, sempre acima dele)
 #define IPH_TRIP_MS             40     // [ms] acima do trip p/ travar falta
-#define IPH_TRIP_HARD_MULT      1.6f   // x IPH_TRIP_A = corte INSTANTÂNEO
+// x IPH_TRIP_A = corte INSTANTANEO (2 fatias de confirmacao).
+// 1,25 e nao 1,6: este multiplicador e o que DEFINE o trip maximo, porque o
+// corte duro tem de ser alcancavel pela medicao (IPH_FS_MARGIN = este valor).
+//   1,60 -> trip max 64,6/1,60 = 40,4 A  ->  orcamento iq 34,0 A
+//   1,25 -> trip max 64,6/1,25 = 51,7 A  ->  orcamento iq 42,5 A   (+25%)
+// O QUE SE PERDE: o corte instantaneo passa de 60% para 25% acima do trip. A
+// operacao normal vive em 85% do trip (I_BUDGET_FRAC), entao a folga entre
+// operar e cortar cai de 88% para 47%. A ondulacao instantanea de |I| medida
+// nas caixas-preta e ~10% acima do valor filtrado, logo 47% ainda e folga
+// larga — e o corte duro exige 2 fatias, o que ja imuniza contra artefato de
+// amostra isolada. Abaixo de ~1,15 comecaria a cortar transiente legitimo.
+#define IPH_TRIP_HARD_MULT      1.25f
                                        // (curto de fase / comutação invertida)
 
 // GUARDA ANTI-DISPARO: tempo que a realimentação de corrente pode ficar
@@ -301,7 +326,17 @@
 #define IPH_CLIP_TRIP_MS        30     // [ms] saturado com o motor ligado = corta
 // Fundo de escala mínimo exigido na calibração, como múltiplo do trip de fase:
 // não adianta proteger em 30 A se o sensor cega em 20 A.
-#define IPH_FS_MARGIN           1.3f
+//
+// NÃO É NÚMERO LIVRE: tem de ser o próprio IPH_TRIP_HARD_MULT, porque o corte
+// INSTANTÂNEO age em trip×HARD_MULT. Com margem menor que ele, a calibração
+// APROVA um trip cujo corte rápido é inalcançável — o sensor satura antes de
+// chegar ao limiar e o curto passa a ser pego só pelo caminho lento (40 ms) ou
+// pela detecção de saturação (30 ms), em vez dos 2 ms do corte duro.
+// Estava em 1,3 fixo contra HARD_MULT de 1,6, e os dois divergiam em silêncio:
+// com shunt de 1 mOhm (fundo de escala 64,6 A) a verificação liberava trip de
+// 49,7 A, cujo corte duro cairia em 79,5 A — 23% acima do que o sensor sabe
+// ler. Amarrado aqui para não poder acontecer de novo.
+#define IPH_FS_MARGIN           IPH_TRIP_HARD_MULT
 
 // NÃO EXISTE MAIS MÉDIA NAS CORRENTES DE FASE. Elas são grandezas AC (até
 // ~200 Hz elétricos): a média de 3 ms da versão anterior as atenuava e
@@ -479,14 +514,34 @@
 #define IQ_MAX_DEFAULT_A        10.0f  // [A] default (ajustável no app)
 // [A] teto ABSOLUTO que o app permite pedir de corrente de fase. Com 6x
 // IRFP4110 (100 V, 3,7 mOhm, 180 A de pacote) o estagio de potencia nao e
-// mais o limite — quem limita e o MOTOR (250 W nominal) e o pack. Este teto
-// existe para o app nao oferecer um numero que o resto do sistema nao
-// sustenta; o orcamento real sai de P_IPH_TRIP * I_BUDGET_FRAC.
-#define IQ_MAX_ABS_A            70.0f
+// mais o limite — quem limita e a MEDICAO (fundo de escala do shunt+INA240),
+// depois o MOTOR (250 W nominal) e o pack. Este teto existe para o app nao
+// oferecer um numero que o resto do sistema nao sustenta; o orcamento real
+// sai de P_IPH_TRIP * I_BUDGET_FRAC — com trip de 48 A isso da 40,8 A.
+#define IQ_MAX_ABS_A            50.0f
 // Fração do TRIP de fase que serve de orçamento para TODA a corrente pedida —
 // o iq do punho e o id do field weakening somados vetorialmente. Não é 1.0
 // porque |I| medido tem ondulação: viver no trip é tripar.
 #define I_BUDGET_FRAC           0.85f
+// ---- DESENROLAR REFERÊNCIA NA REDUÇÃO DE PEDIDO (ver unwindIqTarget) -------
+// [A] folga acima da corrente MEDIDA para onde o alvo salta quando o piloto
+// reduz o pedido com o acionamento saturado. Maior que o ruído+ondulação de iq
+// (~0,5 A) para não saltar em operação normal, pequena para o salto eliminar
+// o trecho morto inteiro.
+#define IQ_UNWIND_MARGIN_A      2.5f
+// [rad/s] o mesmo para o alvo de VELOCIDADE (~0,4 km/h).
+#define VEL_UNWIND_MARGIN_RADS  1.0f
+// Ganhos do integrador do field weakening [A por (% de utilização · s)].
+// Eram 0,8/1,6 fixos no código: 15 A levavam ~2,3 s para entrar. Com 1,6 a
+// constante de tempo do laço externo fica ~0,25 s — ainda dezenas de vezes
+// mais lenta que as malhas de corrente, que é o que mantém o laço estável.
+#define FW_KI_UP                1.6f
+#define FW_KI_DOWN              2.4f
+// Fração do acelerador abaixo da qual é COSTEIRA. A faixa útil [este .. 1] é
+// reescalonada para [0 .. 1]: sem isso o alvo PULA de 0 para este×iqMax ao
+// sair da zona morta (2,7 A com iqMax 45), e com o acelerador só encostado o
+// ruído do potenciômetro faz o alvo pular entre os dois.
+#define THR_COAST_FRAC          0.06f
 
 // PI da malha de corrente (saída em volts, entra em Uq/Ud).
 //   P = L * ωc      I = R * ωc      com ωc = 2π * banda desejada
@@ -536,7 +591,13 @@
 // contra amperimetro): |I| cru dp 0,40 A com o radio ATIVO — que é a
 // condição real de uso (app conectado). Com os shunts de 1 mΩ (2,7x menos
 // ruído nesta escala: 0,107 -> 0,040 A/cnt) desça para ~0,2.
-#define CUR_DEADBAND_A          0.5f
+// Com shunt de FASE de 1 mOhm o ruido FINAL medido caiu para id dp 0,19 A /
+// iq dp 0,05 A com o radio ativo (era 0,50 A no iq com os shunts de 0,34 mOhm,
+// quando 0,50 era o minimo que cobria). 0,30 = ~1,5x o pior ruido atual, que e
+// a regra: cobrir o ruido e nao mais que isso. Zona morta grande demais nao e
+// conservadora — ela cega o integrador para erro REAL em corrente baixa.
+// O 'diag' mede e imprime o veredito; se trocar o shunt, reconferir ali.
+#define CUR_DEADBAND_A          0.30f
 
 // --- MALHA DO EIXO D (id -> 0 via Ud) ---------------------------------------
 // O FOC completo que faltava. Com Ud=0 fixo, qualquer erro de ângulo põe a
@@ -704,15 +765,27 @@
 // Limite de corrente de bateria (foldback suave — reduz potência sem desligar).
 // É o ÚNICO teto de tração: default médio (14 A), teto que o app permite pedir
 // (20 A). Sem teto de potência oculto — quem manda é a "Corrente máxima" do app.
-#define I_LIMIT_DEFAULT_A       14.0f    // [A] limite de corrente de bateria (médio)
-#define I_LIMIT_MAX_A           40.0f    // [A] teto que a dashboard permite pedir
+// TETO FISICO DO INA226: fundo de escala = 81,92 mV / R_shunt. Com o shunt de
+// 3,6 mOhm conferido na fonte isso da +-22,8 A de corrente de BATERIA, e nem
+// o limite nem o trip podem passar disso — acima da saturacao a leitura
+// MENTE PARA BAIXO, igual no lado de fase. Estava em 40 A de limite e 60 A de
+// trip contra uma escala de 22,8 A: o trip de bateria simplesmente NUNCA
+// disparava, e o limite permitia pedir o que o medidor nao sabe ler.
+// 20 A x 42 V = 840 W de barramento, 3,4x o nominal do motor de 250 W.
+// Para passar daqui: shunt do INA226 menor (1,5 mOhm -> 54,6 A de escala, ao
+// custo de resolucao na corrente de bateria).
+#define I_LIMIT_DEFAULT_A       18.0f    // [A] limite de corrente de bateria (médio)
+#define I_LIMIT_MAX_A           20.0f    // [A] teto que a dashboard permite pedir
 
-#define REGEN_I_LIMIT_A         6.0f     // [A] corrente máx. de REGENERAÇÃO (freio)
+// Teto de corrente de FASE do freio (nao de bateria). 6 A dava freio fraco;
+// com 42,5 A de orcamento de fase da para ter freio de verdade. Quem limita o
+// retorno ao pack e a curva CRV_REGEN_V + P_BATT_VMAX, nao este numero.
+#define REGEN_I_LIMIT_A        15.0f     // [A] corrente máx. de REGENERAÇÃO (freio)
                                          //     conservador (regen num pack cheio
                                          //     eleva a tensão do barramento)
 
 // Proteção de SOBRECORRENTE dura (desliga e trava até "limpar faltas")
-#define OC_TRIP_A               60.0f    // [A] trip duro de bateria: acima do limite
+#define OC_TRIP_A               22.0f    // [A] trip duro de bateria: acima do limite
                                          // (20) com margem. Backstop de BATERIA
                                          // (não vê corrente de fase — ver VOVER)
 #define OC_TRIP_MS              100      // [ms] tempo acima do limiar p/ disparar
@@ -766,8 +839,13 @@
 #define NTC_SERIES_R            10000.0f // [Ω] resistor série do divisor
 #define NTC_TO_GND              1        // 1 = NTC p/ GND; 0 = NTC p/ 3,3 V
 
-#define TEMP_DERATE_C           70.0f    // [°C] começa a reduzir potência
-#define TEMP_CUTOFF_C           90.0f    // [°C] corta e trava (falta)
+// IRFP4110 em TO-247 suporta 175 °C de juncao; o NTC mede a PLACA/dissipador,
+// que fica bem abaixo da juncao. 70/90 era dimensionado para os FETs
+// originais. 85/105 usa a margem dos novos sem chegar perto da juncao.
+// Se o NTC estiver longe dos FETs, baixe — a juncao real pode estar 30 °C
+// acima do que ele le.
+#define TEMP_DERATE_C           85.0f    // [°C] começa a reduzir potência
+#define TEMP_CUTOFF_C          105.0f    // [°C] corta e trava (falta)
 #define OT_TRIP_MS              1000     // [ms] filtro do corte térmico
 
 // --- NTC INTERNO do MOTOR (GPIO27) — MODELO PRÓPRIO (diferente do dos MOSFETs) -

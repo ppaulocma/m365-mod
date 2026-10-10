@@ -1380,10 +1380,19 @@ bool phaseCurrentCalibrate() {
     Serial.printf("[iphase] fundo de escala: +-%.1f A (trip de fase %.0f A)\n",
                   fullScale, prm(P_IPH_TRIP));
     if (fullScale < IPH_FS_MARGIN * prm(P_IPH_TRIP)) {
-      Serial.printf("[iphase] SHUNT GRANDE DEMAIS: o sensor satura em %.1f A "
-                    "mas a protecao age em %.0f A — acima da saturacao a "
-                    "leitura MENTE para baixo e a malha dispara. Troque o "
-                    "shunt/ganho.\n", fullScale, prm(P_IPH_TRIP));
+      // A mensagem antiga mandava "trocar o shunt/ganho", que quase nunca e a
+      // saida: o shunt grande e o que da RESOLUCAO, e nao existe INA240 com
+      // ganho menor que 20. Na pratica quem esta errado e o TRIP, e o numero
+      // que resolve e uma divisao que o firmware ja tem na mao — imprimir ele
+      // poupa o usuario de descobrir IPH_FS_MARGIN lendo o codigo.
+      Serial.printf("[iphase] TRIP ACIMA DO FUNDO DE ESCALA: o sensor satura "
+                    "em %.1f A mas a protecao age em %.0f A — passado o fundo "
+                    "de escala a leitura MENTE PARA BAIXO e a malha empurra "
+                    "MAIS tensao.\n", fullScale, prm(P_IPH_TRIP));
+      Serial.printf("[iphase] CONSERTO: 'ipt %.0f' (ou menos) e 'save', depois "
+                    "'cal' de novo. Para passar daqui precisa de shunt MENOR "
+                    "(0,5 mOhm dobra o fundo de escala e corta a resolucao na "
+                    "metade).\n", floorf(fullScale / IPH_FS_MARGIN));
       ok = false;
     }
     const float aPerLsb = apvMax * ADC_V_PER_COUNT;

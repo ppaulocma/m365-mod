@@ -172,6 +172,24 @@ void ina226Task(void *arg) {
                 "escala ±%.0f A)\n",
                 ok ? "OK" : "FALHOU — confira SDA/SCL/endereco (ligue I2C_SCAN)",
                 INA226_ADDR, shunt, (double)(81.92f / shunt));
+  // VERIFICACAO DE FUNDO DE ESCALA, igual a que a calibracao de fase faz.
+  // Nao existia aqui, e por isso o OC_TRIP de 60 A conviveu em silencio com
+  // uma escala de 22,8 A: o trip de sobrecorrente de BATERIA simplesmente
+  // nunca disparava. Passado o fundo de escala a leitura MENTE PARA BAIXO —
+  // mesmo modo de falha do lado de fase, e igualmente invisivel sem aviso.
+  {
+    const float fsA = 81.92f / shunt;
+    if (prm(P_OC_TRIP) > fsA)
+      Serial.printf("[ina226] TRIP DE BATERIA INALCANCAVEL: 'oc' em %.0f A mas "
+                    "o medidor satura em %.1f A — o trip NUNCA dispara. Use "
+                    "'oc %.0f' ou menos.\n",
+                    prm(P_OC_TRIP), fsA, floorf(fsA * 0.95f));
+    if (prm(P_ILIM_A) > fsA * 0.95f)
+      Serial.printf("[ina226] LIMITE DE BATERIA ACIMA DA ESCALA: 'ix' em %.0f A "
+                    "contra %.1f A de fundo de escala — perto da saturacao a "
+                    "leitura mente para baixo e o limite deixa de limitar.\n",
+                    prm(P_ILIM_A), fsA);
+  }
   uint32_t errStreak = 0;
 #endif
 

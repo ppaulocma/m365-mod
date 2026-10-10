@@ -31,7 +31,7 @@ struct Def { uint8_t id, n; int16_t x[CURVE_MAX_PTS], y[CURVE_MAX_PTS]; };
 static const Def DEFS[CURVE_N] = {
   { CRV_THROTTLE, 2, {0, 100},            {0, 100} },
   { CRV_BRAKE,    2, {0, 100},            {0, 100} },
-  // Sobretensão de regen (10s): 100% até 40,5 V, afunila, ZERO a 42,0 V
+  // Sobretensão de regen (10s): 100% até 40,5 V, 25% em 41,8 V, ZERO a 42,5 V
   { CRV_REGEN_V,  4, {250, 405, 418, 425},{100, 100, 25, 0} },
   // Tração x tensão: derate progressivo abaixo de ~34 V
   { CRV_TRAC_V,   4, {310, 320, 335, 440},{20, 45, 100, 100} },
